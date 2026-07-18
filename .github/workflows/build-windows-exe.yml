@@ -41,6 +41,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[ui,dev]"
 
+      - name: Download latest 7-Zip runtime
+        run: python scripts/download_7zip.py tools/7zip ${{ matrix.python_arch }}
+
       - name: Lint
         run: python -m ruff check .
 
@@ -52,12 +55,13 @@ jobs:
           python -m PyInstaller `
             --noconfirm `
             --clean `
-            --onefile `
+            --onedir `
             --noconsole `
             --name backUpHelper `
             --collect-all PySide6 `
             --collect-all qfluentwidgets `
             --add-data "assets/app-icon.svg;assets" `
+            --add-data "tools/7zip;tools/7zip" `
             desktop.py
 
       - name: Package artifact
@@ -65,7 +69,7 @@ jobs:
           $version = python -c "import app_info; print(app_info.__version__)"
           $packageName = "backUpHelper-$version-windows-${{ matrix.artifact_arch }}"
           New-Item -ItemType Directory -Path $packageName | Out-Null
-          Copy-Item "dist/backUpHelper.exe" "$packageName/backUpHelper.exe"
+          Copy-Item "dist/backUpHelper/*" "$packageName" -Recurse
           Copy-Item "README.md" "$packageName/README.md"
           Copy-Item "LICENSE" "$packageName/LICENSE"
           Compress-Archive -Path "$packageName/*" -DestinationPath "$packageName.zip" -Force

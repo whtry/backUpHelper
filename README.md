@@ -68,9 +68,10 @@ pytest
 - Sensitive entries such as SSH keys, Git credentials, browser cookies, and chat
   records are marked as sensitive and are not selected by default.
 - 7z encryption is preferred for sensitive backups.
-- The repository does not currently bundle a 7-Zip binary. If one is added later
-  under `tools/7zip/`, keep the 7-Zip license/source notices with the package:
-  <https://www.7-zip.org/license.txt>.
+- 7-Zip binaries are not committed to Git. Run `python scripts/download_7zip.py`
+  to download the latest official runtime into the ignored `tools/7zip/`
+  directory. CI does the same and includes it in the onedir release package.
+  License information: <https://www.7-zip.org/license.txt>.
 - Conda environments are exported as commands/artifacts that can be reviewed
   before restore.
 - The app icon is based on Bootstrap Icons `archive`, licensed under MIT:
@@ -146,8 +147,9 @@ pytest
 - SSH 密钥、Git 凭据、浏览器 Cookie、聊天记录等敏感项会被标记为敏感，
   并且默认不会被选中。
 - 敏感备份建议优先使用 7z 加密。
-- 仓库当前不直接内置 7-Zip 二进制。如果之后放入 `tools/7zip/`，需要随包保留
-  7-Zip 的许可证和源码说明：<https://www.7-zip.org/license.txt>。
+- 7-Zip 二进制不会提交到 Git。运行 `python scripts/download_7zip.py` 可将
+  官方最新版下载到已忽略的 `tools/7zip/` 目录；CI 也会自动执行，并把它放进
+  onedir 发布包。许可证说明：<https://www.7-zip.org/license.txt>。
 - Conda 环境会导出为可审阅的命令和文件，恢复时不会静默自动执行。
 - 应用图标基于 Bootstrap Icons `archive`，使用 MIT 许可：
   <https://icons.getbootstrap.com/icons/archive/>。

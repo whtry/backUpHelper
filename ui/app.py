@@ -184,6 +184,9 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             return Path(bundle_root) / "assets" / "app-icon.svg"
         return Path(__file__).resolve().parents[1] / "assets" / "app-icon.svg"
 
+    def open_url(url: str) -> None:
+        QDesktopServices.openUrl(QUrl(url))
+
     def apply_theme(value: str) -> None:
         theme = {
             "auto": Theme.AUTO,
@@ -1872,6 +1875,51 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             appearance_layout.addLayout(language_row)
             appearance_layout.addWidget(self.language_hint)
 
+            _, about_layout = self.add_card()
+            self.about_label = SubtitleLabel()
+            self.about_hint = CaptionLabel()
+            self.about_hint.setWordWrap(True)
+            about_layout.addWidget(self.about_label)
+            about_layout.addWidget(self.about_hint)
+            link_grid = QGridLayout()
+            link_grid.setHorizontalSpacing(10)
+            link_grid.setVerticalSpacing(10)
+            self.project_home_button = PushButton(icon("GITHUB", "LINK"), "")
+            self.license_button = PushButton(icon("DOCUMENT", "LINK"), "")
+            for button in (self.project_home_button, self.license_button):
+                button.setMaximumWidth(220)
+            self.project_home_button.clicked.connect(
+                lambda: open_url("https://github.com/whtry/backUpHelper")
+            )
+            self.license_button.clicked.connect(
+                lambda: open_url("https://github.com/whtry/backUpHelper/blob/main/LICENSE")
+            )
+            link_grid.addWidget(self.project_home_button, 0, 0)
+            link_grid.addWidget(self.license_button, 0, 1)
+            self.open_source_label = BodyLabel()
+            link_grid.addWidget(self.open_source_label, 1, 0, 1, 2)
+            self.open_source_buttons: list[PushButton] = []
+            links = [
+                ("Python", "https://www.python.org/"),
+                ("PySide6 / Qt", "https://doc.qt.io/qtforpython-6/"),
+                ("QFluentWidgets", "https://github.com/zhiyiYo/PyQt-Fluent-Widgets"),
+                ("PyInstaller", "https://pyinstaller.org/"),
+                ("7-Zip", "https://www.7-zip.org/"),
+                ("py7zr", "https://github.com/miurahr/py7zr"),
+                ("pycdlib", "https://clalancette.github.io/pycdlib/"),
+                ("cryptography", "https://cryptography.io/"),
+                ("Bootstrap Icons", "https://icons.getbootstrap.com/"),
+                ("pytest", "https://pytest.org/"),
+                ("ruff", "https://docs.astral.sh/ruff/"),
+            ]
+            for index, (name, url) in enumerate(links):
+                button = PushButton(name)
+                button.setMaximumWidth(220)
+                button.clicked.connect(lambda checked=False, target=url: open_url(target))
+                self.open_source_buttons.append(button)
+                link_grid.addWidget(button, 2 + index // 3, index % 3)
+            about_layout.addLayout(link_grid)
+
             _, backup_layout = self.add_card()
             self.preferences_label = SubtitleLabel()
             self.encrypt_default_checkbox = CheckBox()
@@ -1940,6 +1988,11 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.theme_buttons["dark"].setText(t("theme_dark"))
                 self.language_label.setText(t("language"))
                 self.language_hint.setText(t("language_hint"))
+                self.about_label.setText(t("about_project"))
+                self.about_hint.setText(t("about_project_hint"))
+                self.project_home_button.setText(t("project_home"))
+                self.license_button.setText(t("license_file"))
+                self.open_source_label.setText(t("open_source_projects"))
                 self.preferences_label.setText(t("backup_preferences"))
                 self.encrypt_default_checkbox.setText(t("encrypt_by_default"))
                 self.sensitive_confirm_checkbox.setText(t("sensitive_confirm"))

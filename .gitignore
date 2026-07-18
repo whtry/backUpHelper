@@ -14,6 +14,7 @@ build/
 dist/
 *.egg-info/
 .agents
+tools/7zip/
 
 *.zip
 *.7z
