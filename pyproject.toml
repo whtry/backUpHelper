@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "back-up-helper"
+version = "0.1.0"
+description = "A Windows migration backup helper with smart app-data selection and Fluent Design UI."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "backUpHelper contributors" }]
+dependencies = [
+    "cryptography>=42",
+    "py7zr>=0.21",
+    "pycdlib>=1.14",
+    "pydantic>=2.8",
+]
+
+[project.optional-dependencies]
+ui = [
+    "PySide6>=6.7",
+    "PySide6-Fluent-Widgets>=1.7",
+]
+dev = [
+    "pyinstaller>=6.11",
+    "pytest>=8.2",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+back-up-helper = "main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["adapters", "backup", "core", "inventory", "preview", "restore", "ui"]
+include = ["main.py", "desktop.py", "app_info.py", "assets/app-icon.svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

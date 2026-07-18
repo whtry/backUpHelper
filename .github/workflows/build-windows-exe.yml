@@ -1,0 +1,89 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_arch }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_arch: win-x64
+            runs_on: windows-2022
+            python_arch: x64
+          - artifact_arch: win-arm64
+            runs_on: windows-11-arm
+            python_arch: arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.python_arch }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[ui,dev]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Test
+        run: python -m pytest
+
+      - name: Build executable
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --noconsole `
+            --name backUpHelper `
+            --collect-all PySide6 `
+            --collect-all qfluentwidgets `
+            --add-data "assets/app-icon.svg;assets" `
+            desktop.py
+
+      - name: Package artifact
+        run: |
+          $version = python -c "import app_info; print(app_info.__version__)"
+          $packageName = "backUpHelper-$version-windows-${{ matrix.artifact_arch }}"
+          New-Item -ItemType Directory -Path $packageName | Out-Null
+          Copy-Item "dist/backUpHelper.exe" "$packageName/backUpHelper.exe"
+          Copy-Item "README.md" "$packageName/README.md"
+          Copy-Item "LICENSE" "$packageName/LICENSE"
+          Compress-Archive -Path "$packageName/*" -DestinationPath "$packageName.zip" -Force
+          "PACKAGE_NAME=$packageName" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ env.PACKAGE_NAME }}.zip
+          if-no-files-found: error
+
+  windows-x86-compatibility:
+    name: Windows x86 compatibility note
+    runs-on: windows-2022
+    steps:
+      - name: Explain current x86 status
+        run: |
+          "Windows x86 32-bit GUI build is intentionally skipped."
+          "The project uses PySide6, and current PySide6 wheels are published for Windows x64 and Windows ARM64, not win32."
+          "Keep the package name reserved as: backUpHelper-<version>-windows-win-x86.zip if PySide6 win32 support is added later."
