@@ -61,7 +61,6 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             QLabel,
             QListView,
             QListWidgetItem,
-            QMenu,
             QProgressBar,
             QSizePolicy,
             QStackedWidget,
@@ -71,6 +70,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             QWidget,
         )
         from qfluentwidgets import (
+            Action,
             BodyLabel,
             CaptionLabel,
             CheckBox,
@@ -85,6 +85,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             PasswordLineEdit,
             PrimaryPushButton,
             PushButton,
+            RoundMenu,
             ScrollArea,
             SimpleCardWidget,
             SubtitleLabel,
@@ -1349,9 +1350,14 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 path = entry.data(PATH_ROLE)
             if not path:
                 return
-            menu = QMenu(view)
-            explorer_action = menu.addAction(t("open_in_file_explorer"))
-            explorer_action.triggered.connect(lambda: self.open_in_file_explorer(str(path)))
+            menu = RoundMenu(parent=view)
+            menu.setItemHeight(36)
+            explorer_action = Action(
+                icon("FOLDER", "VIEW"),
+                t("open_in_file_explorer"),
+                triggered=lambda: self.open_in_file_explorer(str(path)),
+            )
+            menu.addAction(explorer_action)
             menu.exec(view.viewport().mapToGlobal(position))
 
         def open_in_file_explorer(self, path_text: str) -> None:

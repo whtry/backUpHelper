@@ -57,17 +57,28 @@ jobs:
 
       - name: Build executable
         run: |
+          # QFluentWidgets exposes optional acrylic image helpers. backUpHelper
+          # does not use those effects, so avoid bundling their large numeric and
+          # image-processing stacks.
           python -m PyInstaller `
             --noconfirm `
             --clean `
             --onedir `
             --noconsole `
             --name backUpHelper `
-            --collect-all PySide6 `
-            --collect-all qfluentwidgets `
+            --collect-data qfluentwidgets `
+            --exclude-module numpy `
+            --exclude-module PIL `
+            --exclude-module colorthief `
+            --exclude-module scipy `
             --add-data "assets/app-icon.svg;assets" `
             --add-data "tools/7zip;tools/7zip" `
             desktop.py
+
+      - name: Report bundled size
+        run: |
+          $size = (Get-ChildItem "dist/backUpHelper" -Recurse -File | Measure-Object Length -Sum).Sum
+          "Bundled application size: $([math]::Round($size / 1MB, 1)) MiB"
 
       - name: Package artifact
         run: |
@@ -78,6 +89,8 @@ jobs:
           Copy-Item "README.md" "$packageName/README.md"
           Copy-Item "LICENSE" "$packageName/LICENSE"
           Compress-Archive -Path "$packageName/*" -DestinationPath "$packageName.zip" -Force
+          $archiveSize = (Get-Item "$packageName.zip").Length
+          "Release archive size: $([math]::Round($archiveSize / 1MB, 1)) MiB"
           "PACKAGE_NAME=$packageName" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact
