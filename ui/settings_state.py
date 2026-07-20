@@ -23,8 +23,10 @@ def default_language() -> str:
 class AppSettings:
     language: str = field(default_factory=default_language)
     theme: str = "auto"
+    developer_mode: bool = False
     encrypt_by_default: bool = False
     sensitive_confirm: bool = True
+    temporary_root: str | None = None
     window_geometry: str | None = None
     window_state: str | None = None
     current_page: str = "smartBackupPage"

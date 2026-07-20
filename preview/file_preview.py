@@ -30,19 +30,23 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".wmv", ".webm"}
 
 
-def preview_entry_text(package_path: Path, entry_path: str) -> str:
+def preview_entry_text(
+    package_path: Path,
+    entry_path: str,
+    temporary_root: Path | None = None,
+) -> str:
     suffix = Path(entry_path).suffix.lower()
     if suffix in IMAGE_EXTENSIONS:
-        return "图片文件，可在后续版本中以 Qt 图片预览面板打开。"
+        return "Image file. Select Extract to open it with the local system viewer."
     if suffix in VIDEO_EXTENSIONS:
-        return "视频文件，可在后续版本中通过 Qt Multimedia/FFmpeg 生成预览。"
+        return "Video file. Select Extract to open it with the local system player."
     if suffix not in TEXT_EXTENSIONS and not entry_path.endswith("manifest.json"):
-        return "二进制或未知类型文件，当前仅显示包内路径和大小。"
+        return "Binary or unknown file. The browser shows its package path and size only."
 
-    raw = read_entry_bytes(package_path, entry_path)
+    raw = read_entry_bytes(package_path, entry_path, temporary_root=temporary_root)
     for encoding in ("utf-8", "utf-8-sig", "gb18030", "utf-16"):
         try:
             return raw.decode(encoding)
         except UnicodeDecodeError:
             continue
-    return "文本编码无法识别。"
+    return "The text encoding could not be identified."

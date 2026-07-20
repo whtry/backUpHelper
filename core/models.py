@@ -46,7 +46,7 @@ class BackupItem:
     icon_path: Path | None = None
     risk: RiskLevel = RiskLevel.NORMAL
     sensitive: bool = False
-    default_selected: bool = True
+    default_selected: bool = False
     tags: tuple[str, ...] = ()
     registry_keys: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)

@@ -13,6 +13,7 @@ from core.checksum import sha256_file
 from core.encryption import encrypt_file
 from core.models import ArchiveFormat, BackupItem, BackupManifest, BackupMode, ManifestFile
 from core.serialization import dump_json
+from core.temporary import prepare_temporary_root, temporary_directory
 from inventory.conda import build_conda_export_plans
 from inventory.icons import copy_application_icons
 from inventory.installed_apps import list_installed_applications
@@ -34,6 +35,34 @@ def _archive_path_for(output_path: Path | None, destination: Path, name: str, su
     if output_path:
         return output_path.with_suffix(suffix)
     return (destination / name).with_suffix(suffix)
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def validate_backup_destination(
+    selected_items: list[BackupItem],
+    output_path: Path,
+    temporary_root: Path | None = None,
+) -> None:
+    """Reject output paths that would be captured by the source selection itself."""
+    for item in selected_items:
+        if item.path.is_dir() and _is_within(output_path, item.path):
+            raise ValueError(
+                f"Backup output must be outside the selected source: {item.path} -> {output_path}"
+            )
+        if item.path.is_file() and output_path.resolve() == item.path.resolve():
+            raise ValueError(f"Backup output cannot replace the selected source: {item.path}")
+        if temporary_root and item.path.is_dir() and _is_within(temporary_root, item.path):
+            raise ValueError(
+                "Temporary root must be outside the selected source: "
+                f"{item.path} -> {temporary_root}"
+            )
 
 
 def _stage_files(
@@ -137,6 +166,7 @@ def _archive_with_7z(
     archive_path: Path,
     archive_type: str,
     progress: ProgressCallback | None = None,
+    temporary_root: Path | None = None,
 ) -> Path | None:
     executable = _find_7z()
     if not executable:
@@ -151,6 +181,15 @@ def _archive_with_7z(
         str(archive_path),
         ".",
     ]
+    seven_zip_work_root: Path | None = None
+    if temporary_root:
+        seven_zip_work_root = Path(
+            tempfile.mkdtemp(
+                prefix="back-up-helper-7zip-",
+                dir=prepare_temporary_root(temporary_root),
+            )
+        )
+        command.insert(5, f"-w{seven_zip_work_root}")
     try:
         process = subprocess.Popen(
             command,
@@ -162,25 +201,32 @@ def _archive_with_7z(
             errors="replace",
         )
     except OSError as exc:
+        if seven_zip_work_root:
+            shutil.rmtree(seven_zip_work_root, ignore_errors=True)
         _emit(progress, f"7-Zip unavailable, falling back: {exc}", 0, 1)
         return None
-    assert process.stdout
-    for line in process.stdout:
-        line = line.strip()
-        if line:
-            _emit(progress, line, 0, 1)
-    if process.wait() != 0:
-        raise RuntimeError(f"7-Zip failed with exit code {process.returncode}")
-    _emit(progress, f"Compressed {archive_path.name}", 1, 1)
-    return archive_path
+    try:
+        assert process.stdout
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                _emit(progress, line, 0, 1)
+        if process.wait() != 0:
+            raise RuntimeError(f"7-Zip failed with exit code {process.returncode}")
+        _emit(progress, f"Compressed {archive_path.name}", 1, 1)
+        return archive_path
+    finally:
+        if seven_zip_work_root:
+            shutil.rmtree(seven_zip_work_root, ignore_errors=True)
 
 
 def _zip_directory(
     stage_dir: Path,
     archive_path: Path,
     progress: ProgressCallback | None = None,
+    temporary_root: Path | None = None,
 ) -> Path:
-    seven_zip = _archive_with_7z(stage_dir, archive_path, "zip", progress)
+    seven_zip = _archive_with_7z(stage_dir, archive_path, "zip", progress, temporary_root)
     if seven_zip:
         return seven_zip
     _emit(progress, f"Compressing zip: {archive_path.name}", 0, 1)
@@ -196,8 +242,9 @@ def _seven_z_directory(
     stage_dir: Path,
     archive_path: Path,
     progress: ProgressCallback | None = None,
+    temporary_root: Path | None = None,
 ) -> Path:
-    seven_zip = _archive_with_7z(stage_dir, archive_path, "7z", progress)
+    seven_zip = _archive_with_7z(stage_dir, archive_path, "7z", progress, temporary_root)
     if seven_zip:
         return seven_zip
     try:
@@ -316,10 +363,14 @@ def create_backup_package(
     item_exclusions: dict[str, set[str]] | None = None,
     output_path: Path | None = None,
     progress: ProgressCallback | None = None,
+    temporary_root: Path | None = None,
 ) -> Path:
+    proposed_output = output_path or destination / "backUpHelper-package"
+    temp_root = prepare_temporary_root(temporary_root)
+    validate_backup_destination(selected_items, proposed_output, temp_root)
     destination.mkdir(parents=True, exist_ok=True)
     _emit(progress, "Starting backup package", 0, 5)
-    with tempfile.TemporaryDirectory(prefix="back-up-helper-") as temp:
+    with temporary_directory(prefix="back-up-helper-", temporary_root=temp_root) as temp:
         stage_parent = Path(temp)
         stage_dir = create_stage_directory(
             stage_parent,
@@ -337,6 +388,7 @@ def create_backup_package(
                     stage_dir,
                     _archive_path_for(output_path, destination, stage_dir.name, ".zip"),
                     progress,
+                    temp_root,
                 )
                 return _encrypt_if_needed(zipped, encryption_password, progress)
             final_dir = output_path or destination / stage_dir.name
@@ -348,6 +400,7 @@ def create_backup_package(
                 stage_dir,
                 _archive_path_for(output_path, destination, stage_dir.name, ".zip"),
                 progress,
+                temp_root,
             )
             return _encrypt_if_needed(package, encryption_password, progress)
         if archive_format == ArchiveFormat.SEVEN_Z:
@@ -355,6 +408,7 @@ def create_backup_package(
                 stage_dir,
                 _archive_path_for(output_path, destination, stage_dir.name, ".7z"),
                 progress,
+                temp_root,
             )
             return _encrypt_if_needed(package, encryption_password, progress)
         if archive_format == ArchiveFormat.ISO:

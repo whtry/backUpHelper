@@ -39,7 +39,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[ui,dev]"
+          python -m pip install --only-binary=cryptography -e ".[ui,dev]"
+
+      - name: Verify ARM64 cryptography wheel
+        if: matrix.artifact_arch == 'win-arm64'
+        run: |
+          python -c "import cryptography; assert cryptography.__version__ == '46.0.3', cryptography.__version__"
 
       - name: Download latest 7-Zip runtime
         run: python scripts/download_7zip.py tools/7zip ${{ matrix.python_arch }}

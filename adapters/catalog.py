@@ -17,7 +17,7 @@ class ItemTemplate:
     software: str | None = None
     risk: RiskLevel = RiskLevel.NORMAL
     sensitive: bool = False
-    default_selected: bool = True
+    default_selected: bool = False
     tags: tuple[str, ...] = ()
 
 
@@ -38,7 +38,7 @@ def _known_folder_items() -> list[BackupItem]:
             path=known_folder(name),
             reason=reason,
             risk=RiskLevel.LARGE if name in {"Downloads", "Videos"} else RiskLevel.NORMAL,
-            default_selected=name in {"Desktop", "Documents", "Pictures"},
+            default_selected=False,
             tags=("known-folder",),
         )
         for item_id, name, category, reason in specs
@@ -321,7 +321,7 @@ def discover_backup_items(include_missing: bool = True) -> list[BackupItem]:
                     software=template.software,
                     risk=template.risk,
                     sensitive=template.sensitive,
-                    default_selected=template.default_selected and not template.sensitive,
+                    default_selected=False,
                     tags=template.tags,
                 )
             )

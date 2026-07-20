@@ -23,6 +23,7 @@ TRANSLATIONS = {
         "smart_summary": "已选择 {selected}/{total} 项",
         "smart_summary_detail": "敏感项 {sensitive} 项，当前未发现路径 {missing} 项。",
         "backup_items": "备份项",
+        "filter_backup_items": "筛选备份项",
         "backup_items_selected": "备份项 · 已选择 {selected}/{total} 项 · 未发现 {missing} 项",
         "selected_item_files": "当前备份项文件预览",
         "file_view": "文件视图",
@@ -39,6 +40,7 @@ TRANSLATIONS = {
         "archive_format": "归档格式",
         "include_app_list": "备份已安装应用列表",
         "installed_apps": "已安装应用",
+        "filter_apps": "筛选应用",
         "installed_apps_summary": "发现 {count} 个应用，已选择 {selected} 个。",
         "installed_apps_not_loaded": "应用列表未加载，启动时不扫描以保持首页流畅。",
         "loading_apps": "正在读取已安装应用...",
@@ -67,6 +69,8 @@ TRANSLATIONS = {
         "backup_running_body": "请等待当前备份完成后再关闭窗口。",
         "missing_password": "密码缺失",
         "missing_password_body": "启用加密时需要输入加密密码。",
+        "nothing_selected": "未选择备份内容",
+        "nothing_selected_body": "请选择至少一个备份项或已安装应用后再创建备份。",
         "full_title": "完整备份",
         "full_subtitle": (
             "盘符 ISO 和文件夹归档分开处理。ISO 是文件级镜像，"
@@ -99,6 +103,9 @@ TRANSLATIONS = {
         "manifest_summary": "清单摘要",
         "files": "文件",
         "preview": "预览",
+        "filter_files": "筛选文件",
+        "extract_selected_entry": "导出选中文件",
+        "image_preview_failed": "无法预览此图片，请导出后使用本地应用打开。",
         "cannot_open_package": "无法打开备份包",
         "created_at": "创建时间",
         "mode": "模式",
@@ -111,6 +118,21 @@ TRANSLATIONS = {
         "restore_root": "恢复根目录",
         "choose_restore_root": "选择恢复根目录",
         "create_restore_plan": "生成恢复预案",
+        "conflict_policy": "同名文件处理",
+        "conflict_skip": "跳过已有文件",
+        "conflict_overwrite": "覆盖已有文件",
+        "restore_confirm": "我已检查预案，并确认开始恢复文件",
+        "execute_restore": "执行恢复",
+        "restore_progress": "恢复进度",
+        "restore_starting": "开始恢复文件...",
+        "restore_finished_summary": (
+            "已恢复 {restored} 个文件，跳过 {skipped} 个冲突，跳过 {unsafe} 个不安全条目。"
+        ),
+        "restore_failed": "恢复失败",
+        "restore_confirmation_title": "需要恢复确认",
+        "restore_confirmation_body": (
+            "请先勾选确认选项。恢复仅写入文件，不会自动导入注册表或执行命令。"
+        ),
         "restore_plan": "恢复预案",
         "missing_restore_body": "请选择备份包和恢复根目录。",
         "cannot_create_restore_plan": "无法生成恢复预案",
@@ -142,8 +164,17 @@ TRANSLATIONS = {
         "license_file": "许可证文件",
         "open_source_projects": "本项目使用的开源项目",
         "backup_preferences": "备份偏好",
+        "developer_mode": "开发者模式",
+        "developer_mode_hint": (
+            "开启完整备份和恢复等实验性功能。它们可能写入大量数据或覆盖已有文件，"
+            "请确认用途后再启用。"
+        ),
         "encrypt_by_default": "默认启用输出加密",
         "sensitive_confirm": "敏感备份项需要确认",
+        "temporary_root": "临时工作目录",
+        "temporary_root_system": "使用 Windows 系统临时目录",
+        "choose_temporary_root": "选择临时目录",
+        "reset_temporary_root": "恢复系统默认",
     },
     "en_US": {
         "app_title": "backUpHelper",
@@ -162,6 +193,7 @@ TRANSLATIONS = {
         "smart_summary": "Selected {selected}/{total} items",
         "smart_summary_detail": "{sensitive} sensitive items, {missing} selected paths missing.",
         "backup_items": "Backup items",
+        "filter_backup_items": "Filter backup items",
         "backup_items_selected": (
             "Backup items · Selected {selected}/{total} · Missing {missing}"
         ),
@@ -180,6 +212,7 @@ TRANSLATIONS = {
         "archive_format": "Archive format",
         "include_app_list": "Back up installed application list",
         "installed_apps": "Installed applications",
+        "filter_apps": "Filter applications",
         "installed_apps_summary": "{count} apps found, {selected} selected.",
         "installed_apps_not_loaded": (
             "Application list is not loaded yet; startup skips it for speed."
@@ -213,6 +246,8 @@ TRANSLATIONS = {
         "backup_running_body": "Wait for the current backup to finish before closing the window.",
         "missing_password": "Missing password",
         "missing_password_body": "Enter an encryption password when encryption is enabled.",
+        "nothing_selected": "Nothing selected",
+        "nothing_selected_body": "Select at least one backup item or installed application first.",
         "full_title": "Full backup",
         "full_subtitle": (
             "Volume ISO and folder archives are separate flows. "
@@ -241,6 +276,9 @@ TRANSLATIONS = {
         "manifest_summary": "Manifest summary",
         "files": "Files",
         "preview": "Preview",
+        "filter_files": "Filter files",
+        "extract_selected_entry": "Extract selected file",
+        "image_preview_failed": "This image cannot be previewed. Extract it and open it locally.",
         "cannot_open_package": "Cannot open package",
         "created_at": "Created",
         "mode": "Mode",
@@ -253,6 +291,23 @@ TRANSLATIONS = {
         "restore_root": "Restore root",
         "choose_restore_root": "Choose restore root",
         "create_restore_plan": "Create restore plan",
+        "conflict_policy": "Existing file handling",
+        "conflict_skip": "Skip existing files",
+        "conflict_overwrite": "Overwrite existing files",
+        "restore_confirm": "I reviewed the plan and confirm restoring files",
+        "execute_restore": "Run restore",
+        "restore_progress": "Restore progress",
+        "restore_starting": "Starting restore...",
+        "restore_finished_summary": (
+            "Restored {restored} files, skipped {skipped} conflicts, and skipped "
+            "{unsafe} unsafe entries."
+        ),
+        "restore_failed": "Restore failed",
+        "restore_confirmation_title": "Restore confirmation required",
+        "restore_confirmation_body": (
+            "Select the confirmation option first. Restore writes files only; it never imports "
+            "registry data or runs commands automatically."
+        ),
         "restore_plan": "Restore plan",
         "missing_restore_body": "Choose a package and restore root.",
         "cannot_create_restore_plan": "Cannot create restore plan",
@@ -284,8 +339,17 @@ TRANSLATIONS = {
         "license_file": "License file",
         "open_source_projects": "Open-source projects used by this app",
         "backup_preferences": "Backup preferences",
+        "developer_mode": "Developer mode",
+        "developer_mode_hint": (
+            "Enable experimental Full backup and Restore features. They may write large amounts "
+            "of data or overwrite existing files; enable only when you understand the workflow."
+        ),
         "encrypt_by_default": "Enable output encryption by default",
         "sensitive_confirm": "Confirm sensitive backup items",
+        "temporary_root": "Temporary work directory",
+        "temporary_root_system": "Use the Windows system temporary directory",
+        "choose_temporary_root": "Choose temporary directory",
+        "reset_temporary_root": "Use system default",
     },
 }
 

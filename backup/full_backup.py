@@ -34,6 +34,7 @@ def create_folder_backup(
     encryption_password: str | None = None,
     output_path: Path | None = None,
     progress=None,
+    temporary_root: Path | None = None,
 ) -> Path:
     item = _full_backup_item(
         target,
@@ -49,6 +50,7 @@ def create_folder_backup(
         encryption_password=encryption_password,
         output_path=output_path,
         progress=progress,
+        temporary_root=temporary_root,
     )
 
 
@@ -58,6 +60,7 @@ def create_volume_iso_backup(
     encryption_password: str | None = None,
     output_path: Path | None = None,
     progress=None,
+    temporary_root: Path | None = None,
 ) -> Path:
     target = FullBackupTarget(path=volume_root, label=str(volume_root), is_volume_root=True)
     item = _full_backup_item(
@@ -74,6 +77,7 @@ def create_volume_iso_backup(
         encryption_password=encryption_password,
         output_path=output_path,
         progress=progress,
+        temporary_root=temporary_root,
     )
 
 
@@ -84,6 +88,7 @@ def create_file_level_full_backup(
     encryption_password: str | None = None,
     output_path: Path | None = None,
     progress=None,
+    temporary_root: Path | None = None,
 ) -> Path:
     if target.is_volume_root and archive_format == ArchiveFormat.ISO:
         return create_volume_iso_backup(
@@ -92,6 +97,7 @@ def create_file_level_full_backup(
             encryption_password,
             output_path,
             progress,
+            temporary_root,
         )
     return create_folder_backup(
         target,
@@ -100,4 +106,5 @@ def create_file_level_full_backup(
         encryption_password,
         output_path,
         progress,
+        temporary_root,
     )

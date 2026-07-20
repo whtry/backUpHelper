@@ -33,6 +33,20 @@ def main() -> int:
         default=ArchiveFormat.ZIP.value,
         help="Archive format for --backup",
     )
+    parser.add_argument(
+        "--items",
+        help="Comma-separated smart backup item IDs to include with --backup",
+    )
+    parser.add_argument(
+        "--all-items",
+        action="store_true",
+        help="Include every discovered smart backup item with --backup",
+    )
+    parser.add_argument(
+        "--temp-root",
+        type=Path,
+        help="Temporary work root for staging and compression",
+    )
     args = parser.parse_args()
 
     if args.ui:
@@ -48,7 +62,19 @@ def main() -> int:
         return 0
 
     if args.backup:
-        selected_items = [item for item in items if item.default_selected]
+        requested_ids = {
+            item_id.strip() for item_id in (args.items or "").split(",") if item_id.strip()
+        }
+        available_ids = {item.id for item in items}
+        unknown_ids = requested_ids - available_ids
+        if unknown_ids:
+            parser.error(f"Unknown backup item IDs: {', '.join(sorted(unknown_ids))}")
+        if args.all_items:
+            selected_items = items
+        else:
+            selected_items = [item for item in items if item.id in requested_ids]
+        if not selected_items:
+            parser.error("Use --items <id,id> or --all-items when creating a backup")
         for item in selected_items:
             logger.info("Selected item: %s -> %s", item.name, item.path)
 
@@ -63,6 +89,7 @@ def main() -> int:
             selected_items=selected_items,
             archive_format=ArchiveFormat(args.format),
             progress=progress,
+            temporary_root=args.temp_root,
         )
         logger.info("Backup created: %s", package)
         print(package)

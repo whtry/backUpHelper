@@ -14,8 +14,9 @@ from backup.volumes import list_windows_volumes
 from core.models import ArchiveFormat, BackupItem
 from inventory.icons import normalize_icon_path
 from inventory.installed_apps import list_installed_applications
-from preview.file_preview import preview_entry_text
-from preview.package_reader import list_entries, read_manifest
+from preview.file_preview import IMAGE_EXTENSIONS, preview_entry_text
+from preview.package_reader import copy_entry_to, list_entries, read_entry_bytes, read_manifest
+from restore.executor import execute_restore_plan
 from restore.planner import build_restore_plan
 from ui.i18n import SUPPORTED_LANGUAGES, tr
 from ui.settings_state import load_settings, save_settings
@@ -45,7 +46,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             Signal,
             Slot,
         )
-        from PySide6.QtGui import QDesktopServices, QFont, QIcon
+        from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap
         from PySide6.QtWidgets import (
             QAbstractItemView,
             QAbstractScrollArea,
@@ -56,6 +57,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             QGridLayout,
             QHBoxLayout,
             QHeaderView,
+            QLabel,
             QListView,
             QListWidgetItem,
             QProgressBar,
@@ -194,6 +196,9 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             "dark": Theme.DARK,
         }[value]
         setTheme(theme)
+
+    def configured_temporary_root() -> Path | None:
+        return Path(settings.temporary_root) if settings.temporary_root else None
 
     def apply_app_style(app: QApplication) -> None:
         font = QFont("Microsoft YaHei UI")
@@ -414,7 +419,12 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.backup_clear_button.setMaximumWidth(120)
             self.backup_clear_button.clicked.connect(self.clear_backup_items)
             self.selected_files_label = SubtitleLabel()
+            self.item_filter_input = LineEdit()
+            self.item_filter_input.setMaximumWidth(230)
+            self.item_filter_input.setClearButtonEnabled(True)
+            self.item_filter_input.textChanged.connect(self.filter_backup_items)
             header_row.addWidget(self.backup_items_label, 3)
+            header_row.addWidget(self.item_filter_input)
             preview_header = QHBoxLayout()
             self.file_view_label = BodyLabel()
             self.file_view_combo = ComboBox()
@@ -442,6 +452,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.table.setWordWrap(False)
             self.table.setShowGrid(False)
             self.table.setMinimumHeight(420)
+            self.table.setMaximumHeight(520)
             self.table.itemChanged.connect(self.on_item_changed)
             self.table.currentCellChanged.connect(self.on_current_item_changed)
             make_table_columns_resizable(self.table, 48)
@@ -502,6 +513,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             apps_header = QHBoxLayout()
             self.apps_label = SubtitleLabel()
             self.apps_summary_label = CaptionLabel()
+            self.apps_filter_input = LineEdit()
+            self.apps_filter_input.setMaximumWidth(230)
+            self.apps_filter_input.setClearButtonEnabled(True)
+            self.apps_filter_input.textChanged.connect(self.filter_apps)
             self.load_apps_button = PushButton(icon("SYNC", "APPLICATION"), "")
             self.load_apps_button.setMaximumWidth(170)
             self.load_apps_button.clicked.connect(self.load_installed_apps)
@@ -514,6 +529,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             apps_header.addWidget(self.apps_label)
             apps_header.addStretch(1)
             apps_header.addWidget(self.apps_summary_label)
+            apps_header.addWidget(self.apps_filter_input)
             apps_header.addWidget(self.load_apps_button)
             apps_header.addWidget(self.apps_select_all_button)
             apps_header.addWidget(self.apps_clear_button)
@@ -523,6 +539,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.apps_table.setWordWrap(False)
             self.apps_table.verticalHeader().setVisible(False)
             self.apps_table.setMinimumHeight(230)
+            self.apps_table.setMaximumHeight(330)
             self.apps_table.itemChanged.connect(self.on_app_item_changed)
             make_table_columns_resizable(self.apps_table, 48)
             self.apps_table.setColumnWidth(1, 260)
@@ -566,9 +583,6 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.root_layout.addStretch(1)
             self.retranslate()
             self.update_selection_label()
-            if self.items:
-                self.table.setCurrentCell(0, 1)
-                self.prepare_file_preview(0)
 
         def populate_table(self) -> None:
             self.loading_table = True
@@ -626,15 +640,33 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     table_item.setToolTip(value)
                     table_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.table.setUpdatesEnabled(True)
+            self.filter_backup_items()
+
+        def filter_backup_items(self) -> None:
+            if not hasattr(self, "table"):
+                return
+            query = self.item_filter_input.text().strip().casefold()
+            for row, item in self.item_by_row.items():
+                search_text = " ".join(
+                    (item.name, item.category, item.software or "", str(item.path), item.reason)
+                ).casefold()
+                self.table.setRowHidden(row, bool(query and query not in search_text))
 
         def set_backup_items_checked(self, checked: bool) -> None:
             self.loading_table = True
-            self.selected_ids = {item.id for item in self.items} if checked else set()
+            if checked and settings.sensitive_confirm:
+                self.selected_ids = {item.id for item in self.items if not item.sensitive}
+            else:
+                self.selected_ids = {item.id for item in self.items} if checked else set()
             self.excluded_paths_by_item.clear()
-            state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-            for row in self.item_by_row:
+            for row, item in self.item_by_row.items():
                 check_item = self.table.item(row, 0)
                 if check_item:
+                    state = (
+                        Qt.CheckState.Checked
+                        if item.id in self.selected_ids
+                        else Qt.CheckState.Unchecked
+                    )
                     check_item.setCheckState(state)
             self.loading_table = False
             self.update_selection_label()
@@ -727,6 +759,19 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             state = tree_item.checkState(0)
             self.loading_preview_tree = True
             if state == Qt.CheckState.Checked:
+                selected_item = next(
+                    (candidate for candidate in self.items if candidate.id == item_id),
+                    None,
+                )
+                if (
+                    selected_item
+                    and selected_item.sensitive
+                    and settings.sensitive_confirm
+                    and not self.confirm_sensitive_item(selected_item)
+                ):
+                    tree_item.setCheckState(Qt.CheckState.Unchecked)
+                    self.loading_preview_tree = False
+                    return
                 self.selected_ids.add(item_id)
                 self.remove_exclusion_path(item_id, relative_path)
                 self.set_tree_item_check_state(tree_item, Qt.CheckState.Checked)
@@ -833,7 +878,23 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                             table_item.setIcon(self.icon_provider.icon(QFileInfo(str(icon_path))))
                     table_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.apps_table.setUpdatesEnabled(True)
+            self.filter_apps()
             self.update_apps_summary()
+
+        def filter_apps(self) -> None:
+            if not hasattr(self, "apps_table"):
+                return
+            query = self.apps_filter_input.text().strip().casefold()
+            for row, app in self.app_by_row.items():
+                search_text = " ".join(
+                    (
+                        app.name,
+                        app.version or "",
+                        app.publisher or "",
+                        app.install_location or "",
+                    )
+                ).casefold()
+                self.apps_table.setRowHidden(row, bool(query and query not in search_text))
 
         def set_apps_checked(self, checked: bool) -> None:
             if checked and not self.installed_apps:
@@ -888,6 +949,12 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 return
             check_state = table_item.checkState()
             if check_state == Qt.CheckState.Checked:
+                needs_confirmation = item.sensitive and settings.sensitive_confirm
+                if needs_confirmation and not self.confirm_sensitive_item(item):
+                    self.loading_table = True
+                    table_item.setCheckState(Qt.CheckState.Unchecked)
+                    self.loading_table = False
+                    return
                 self.selected_ids.add(item.id)
                 self.excluded_paths_by_item.pop(item.id, None)
             elif check_state == Qt.CheckState.Unchecked:
@@ -898,6 +965,14 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.update_selection_label()
             if self.table.currentRow() == table_item.row():
                 self.prepare_file_preview(table_item.row())
+
+        def confirm_sensitive_item(self, item: BackupItem) -> bool:
+            dialog = MessageBox(
+                t("sensitive_title"),
+                t("sensitive_body", name=item.name),
+                self,
+            )
+            return bool(dialog.exec())
 
         def on_current_item_changed(self, row: int, *_: object) -> None:
             self.prepare_file_preview(row)
@@ -949,7 +1024,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             return sorted(children, key=lambda child: (child.is_file(), child.name.lower()))
 
         def add_lazy_dummy_if_needed(self, tree_item: QTreeWidgetItem, path: Path) -> None:
-            if path.is_dir() and self.direct_child_entries(path):
+            if path.is_dir() and tree_item.childCount() == 0:
                 dummy = QTreeWidgetItem([""])
                 dummy.setData(0, DUMMY_NODE_ROLE, True)
                 tree_item.addChild(dummy)
@@ -1016,12 +1091,9 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 return
             self.file_preview_tree.setHeaderLabels([t("path_tree")])
             self.loading_preview_tree = True
-            root = self.make_preview_tree_item(item, item.path, None)
-            self.populate_preview_tree_children(root)
+            self.make_preview_tree_item(item, item.path, None)
             self.loading_preview_tree = False
-            self.file_preview_tree.expandItem(root)
             self.file_preview_list.addItem(t("preview_click_to_load"))
-            self.preview_timer.start(180)
 
         def load_current_file_preview(self) -> None:
             row = self.table.currentRow()
@@ -1199,11 +1271,15 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 return
             selected = [item for item in self.items if item.id in self.selected_ids]
             selected_app_names = set(self.selected_app_names)
+            if not selected and not selected_app_names:
+                MessageBox(t("nothing_selected"), t("nothing_selected_body"), self).exec()
+                return
             item_exclusions = {
                 item_id: set(paths)
                 for item_id, paths in self.excluded_paths_by_item.items()
                 if paths
             }
+            temporary_root = configured_temporary_root()
             self.smart_log_text.clear()
             self.log_smart(t("backup_starting"))
             for item in selected:
@@ -1222,6 +1298,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     item_exclusions=item_exclusions,
                     output_path=output_path,
                     progress=progress,
+                    temporary_root=temporary_root,
                 )
 
             self.start_smart_backup_worker(task)
@@ -1271,6 +1348,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             super().retranslate()
             if hasattr(self, "backup_items_label"):
                 self.backup_items_label.setText(t("backup_items"))
+                self.item_filter_input.setPlaceholderText(t("filter_backup_items"))
                 self.backup_select_all_button.setText(t("select_all"))
                 self.backup_clear_button.setText(t("clear_selection"))
                 self.selected_files_label.setText(t("selected_item_files"))
@@ -1286,6 +1364,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.file_view_combo.setItemText(3, t("view_icons"))
                 self.preview_button.setText(t("load_preview"))
                 self.apps_label.setText(t("installed_apps"))
+                self.apps_filter_input.setPlaceholderText(t("filter_apps"))
                 self.load_apps_button.setText(t("load_apps"))
                 self.apps_select_all_button.setText(t("select_all"))
                 self.apps_clear_button.setText(t("clear_selection"))
@@ -1440,6 +1519,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 return
             volume = Path(self.volume_combo.currentText())
             output_path = self.volume_destination_path
+            temporary_root = configured_temporary_root()
             self.full_log_text.clear()
             self.log_full(t("backup_starting"))
             self.log_full(f"Selected volume: {volume}")
@@ -1452,6 +1532,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     password,
                     output_path=output_path,
                     progress=progress,
+                    temporary_root=temporary_root,
                 )
 
             self.start_full_backup_worker(task)
@@ -1488,6 +1569,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             folder_path = self.folder_path
             output_path = self.folder_destination_path
             archive_format = ArchiveFormat(self.folder_format_combo.currentText())
+            temporary_root = configured_temporary_root()
             self.full_log_text.clear()
             self.log_full(t("backup_starting"))
             self.log_full(f"Selected folder: {folder_path}")
@@ -1501,6 +1583,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     password,
                     output_path=output_path,
                     progress=progress,
+                    temporary_root=temporary_root,
                 )
 
             self.start_full_backup_worker(task)
@@ -1594,9 +1677,14 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.open_dir_button = PushButton(icon("FOLDER"), "")
             self.open_dir_button.setMaximumWidth(210)
             self.open_dir_button.clicked.connect(self.open_package_directory)
+            self.extract_entry_button = PushButton(icon("SAVE", "FOLDER"), "")
+            self.extract_entry_button.setMaximumWidth(190)
+            self.extract_entry_button.setEnabled(False)
+            self.extract_entry_button.clicked.connect(self.extract_selected_entry)
             picker_row.addWidget(self.package_input, 1)
             picker_row.addWidget(self.open_file_button)
             picker_row.addWidget(self.open_dir_button)
+            picker_row.addWidget(self.extract_entry_button)
             picker_layout.addLayout(picker_row)
 
             _, browser_layout = self.add_card()
@@ -1607,6 +1695,9 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.manifest_label = SubtitleLabel()
             self.files_label = SubtitleLabel()
             self.preview_label = SubtitleLabel()
+            self.entry_filter_input = LineEdit()
+            self.entry_filter_input.setClearButtonEnabled(True)
+            self.entry_filter_input.textChanged.connect(self.filter_entries)
             self.manifest_text = TextEdit()
             self.manifest_text.setReadOnly(True)
             self.manifest_text.setMinimumHeight(96)
@@ -1625,12 +1716,23 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.preview_text = TextEdit()
             self.preview_text.setReadOnly(True)
             self.preview_text.setMinimumHeight(520)
+            self.preview_image = QLabel()
+            self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.preview_image.setMinimumHeight(520)
+            self.preview_image.setWordWrap(True)
+            self.preview_stack = QStackedWidget()
+            self.preview_stack.addWidget(self.preview_text)
+            self.preview_stack.addWidget(self.preview_image)
             left_col.addWidget(self.manifest_label)
             left_col.addWidget(self.manifest_text)
-            left_col.addWidget(self.files_label)
+            files_header = QHBoxLayout()
+            files_header.addWidget(self.files_label)
+            files_header.addStretch(1)
+            files_header.addWidget(self.entry_filter_input)
+            left_col.addLayout(files_header)
             left_col.addWidget(self.entry_table, 1)
             right_col.addWidget(self.preview_label)
-            right_col.addWidget(self.preview_text, 1)
+            right_col.addWidget(self.preview_stack, 1)
             split_row.addLayout(left_col, 2)
             split_row.addLayout(right_col, 3)
             browser_layout.addLayout(split_row)
@@ -1642,7 +1744,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self,
                 t("open_backup_file"),
                 "",
-                "Backup packages (*.zip *.7z);;All files (*.*)",
+                "Backup packages (*.zip *.7z *.iso);;All files (*.*)",
             )
             if file_name:
                 self.load_package(Path(file_name))
@@ -1654,13 +1756,14 @@ def run_app(auto_quit_ms: int | None = None) -> int:
 
         def load_package(self, package_path: Path) -> None:
             try:
-                manifest = read_manifest(package_path)
+                manifest = read_manifest(package_path, configured_temporary_root())
                 entries = list_entries(package_path)
             except Exception as exc:
                 MessageBox(t("cannot_open_package"), str(exc), self).exec()
                 return
             self.current_package_path = package_path
             self.package_input.setText(str(package_path))
+            self.extract_entry_button.setEnabled(bool(entries))
             self.entry_by_row.clear()
             self.entry_table.clearContents()
             self.entry_table.setRowCount(len(entries))
@@ -1687,6 +1790,33 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             )
             if entries:
                 self.entry_table.setCurrentCell(0, 0)
+            self.filter_entries()
+
+        def filter_entries(self) -> None:
+            query = self.entry_filter_input.text().strip().casefold()
+            for row, entry_path in self.entry_by_row.items():
+                hidden = bool(query and query not in entry_path.casefold())
+                self.entry_table.setRowHidden(row, hidden)
+
+        def extract_selected_entry(self) -> None:
+            if not self.current_package_path:
+                return
+            entry_path = self.entry_by_row.get(self.entry_table.currentRow())
+            if not entry_path:
+                return
+            destination_dir = QFileDialog.getExistingDirectory(self, t("extract_selected_entry"))
+            if not destination_dir:
+                return
+            try:
+                target = Path(destination_dir) / Path(entry_path)
+                copy_entry_to(
+                    self.current_package_path,
+                    entry_path,
+                    target,
+                    configured_temporary_root(),
+                )
+            except Exception as exc:
+                MessageBox(t("cannot_open_package"), str(exc), self).exec()
 
         def preview_selected_entry(self, row: int = -1, *_: object) -> None:
             if not self.current_package_path:
@@ -1697,16 +1827,45 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             if not entry_path:
                 return
             try:
-                text = preview_entry_text(self.current_package_path, entry_path)
+                if Path(entry_path).suffix.lower() in IMAGE_EXTENSIONS:
+                    image = QPixmap()
+                    raw = read_entry_bytes(
+                        self.current_package_path,
+                        entry_path,
+                        limit=16 * 1024 * 1024,
+                        temporary_root=configured_temporary_root(),
+                    )
+                    if image.loadFromData(raw):
+                        self.preview_image.setPixmap(
+                            image.scaled(
+                                self.preview_stack.size(),
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation,
+                            )
+                        )
+                        self.preview_stack.setCurrentWidget(self.preview_image)
+                        return
+                    self.preview_image.setText(t("image_preview_failed"))
+                    self.preview_stack.setCurrentWidget(self.preview_image)
+                    return
+                text = preview_entry_text(
+                    self.current_package_path,
+                    entry_path,
+                    configured_temporary_root(),
+                )
                 self.preview_text.setPlainText(text)
+                self.preview_stack.setCurrentWidget(self.preview_text)
             except Exception as exc:
                 self.preview_text.setPlainText(str(exc))
+                self.preview_stack.setCurrentWidget(self.preview_text)
 
         def retranslate(self) -> None:
             super().retranslate()
             if hasattr(self, "open_file_button"):
                 self.open_file_button.setText(t("open_backup_file"))
                 self.open_dir_button.setText(t("open_backup_dir"))
+                self.extract_entry_button.setText(t("extract_selected_entry"))
+                self.entry_filter_input.setPlaceholderText(t("filter_files"))
                 self.manifest_label.setText(t("manifest_summary"))
                 self.files_label.setText(t("files"))
                 self.preview_label.setText(t("preview"))
@@ -1717,6 +1876,9 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             super().__init__("restore_title", "restore_subtitle")
             self.package_path: Path | None = None
             self.restore_root: Path | None = None
+            self.restore_plan = None
+            self.restore_thread: QThread | None = None
+            self.restore_worker: BackupJobWorker | None = None
             _, form_layout = self.add_card()
             grid = QGridLayout()
             grid.setHorizontalSpacing(14)
@@ -1739,13 +1901,25 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.plan_button.setMinimumHeight(46)
             self.plan_button.setMaximumWidth(240)
             self.plan_button.clicked.connect(self.create_plan)
+            self.conflict_policy_label = BodyLabel()
+            self.conflict_policy_combo = ComboBox()
+            self.conflict_policy_combo.addItems(["skip", "overwrite"])
+            self.restore_confirm_checkbox = CheckBox()
+            self.restore_button = PrimaryPushButton(icon("PLAY", "RETURN"), "")
+            self.restore_button.setMaximumWidth(240)
+            self.restore_button.setEnabled(False)
+            self.restore_button.clicked.connect(self.execute_restore)
             grid.addWidget(self.package_label, 0, 0)
             grid.addWidget(self.package_input, 0, 1)
             grid.addWidget(self.open_package_button, 0, 2)
             grid.addWidget(self.restore_root_label, 1, 0)
             grid.addWidget(self.restore_input, 1, 1)
             grid.addWidget(self.choose_restore_button, 1, 2)
-            grid.addWidget(self.plan_button, 2, 2, alignment=Qt.AlignmentFlag.AlignRight)
+            grid.addWidget(self.conflict_policy_label, 2, 0)
+            grid.addWidget(self.conflict_policy_combo, 2, 1)
+            grid.addWidget(self.plan_button, 3, 1, alignment=Qt.AlignmentFlag.AlignRight)
+            grid.addWidget(self.restore_confirm_checkbox, 4, 1)
+            grid.addWidget(self.restore_button, 4, 2, alignment=Qt.AlignmentFlag.AlignRight)
             form_layout.addLayout(grid)
 
             _, plan_layout = self.add_card()
@@ -1766,6 +1940,17 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.plan_table.setColumnWidth(2, 110)
             plan_layout.addWidget(self.plan_table, 1)
             self.trap_child_wheel(self.plan_table)
+            _, progress_layout = self.add_card()
+            self.restore_progress_label = SubtitleLabel()
+            self.restore_progress_bar = QProgressBar()
+            self.restore_progress_bar.setRange(0, 100)
+            self.restore_progress_bar.setValue(0)
+            self.restore_log_text = TextEdit()
+            self.restore_log_text.setReadOnly(True)
+            self.restore_log_text.setMaximumHeight(130)
+            progress_layout.addWidget(self.restore_progress_label)
+            progress_layout.addWidget(self.restore_progress_bar)
+            progress_layout.addWidget(self.restore_log_text)
             self.retranslate()
 
         def open_package(self) -> None:
@@ -1773,7 +1958,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self,
                 t("open_backup_file"),
                 "",
-                "Backup packages (*.zip *.7z);;All files (*.*)",
+                "Backup packages (*.zip *.7z *.iso);;All files (*.*)",
             )
             if file_name:
                 self.package_path = Path(file_name)
@@ -1790,10 +1975,17 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 MessageBox(t("missing_path"), t("missing_restore_body"), self).exec()
                 return
             try:
-                plan = build_restore_plan(self.package_path, self.restore_root)
+                plan = build_restore_plan(
+                    self.package_path,
+                    self.restore_root,
+                    configured_temporary_root(),
+                )
             except Exception as exc:
                 MessageBox(t("cannot_create_restore_plan"), str(exc), self).exec()
                 return
+            self.restore_plan = plan
+            self.restore_confirm_checkbox.setChecked(False)
+            self.restore_button.setEnabled(True)
             conflicts = sum(1 for operation in plan.operations if operation.conflict)
             self.restore_plan_summary.setText(
                 " · ".join(
@@ -1821,6 +2013,79 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     table_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                     self.plan_table.setItem(row, column, table_item)
 
+        def execute_restore(self) -> None:
+            if not self.restore_plan:
+                return
+            if not self.restore_confirm_checkbox.isChecked():
+                MessageBox(
+                    t("restore_confirmation_title"),
+                    t("restore_confirmation_body"),
+                    self,
+                ).exec()
+                return
+            if self.restore_thread and self.restore_thread.isRunning():
+                return
+            plan = self.restore_plan
+            policy = ("skip", "overwrite")[self.conflict_policy_combo.currentIndex()]
+            temporary_root = configured_temporary_root()
+            self.restore_log_text.clear()
+            self.log_restore(t("restore_starting"))
+
+            def task(progress):
+                return execute_restore_plan(plan, policy, progress, temporary_root)
+
+            self.restore_button.setEnabled(False)
+            self.restore_progress_bar.setValue(0)
+            self.restore_thread = QThread(self)
+            self.restore_worker = BackupJobWorker(task)
+            self.restore_worker.moveToThread(self.restore_thread)
+            self.restore_thread.started.connect(self.restore_worker.run)
+            self.restore_worker.progress.connect(self.on_restore_progress)
+            self.restore_worker.finished.connect(self.on_restore_finished)
+            self.restore_worker.failed.connect(self.on_restore_failed)
+            self.restore_worker.finished.connect(self.restore_thread.quit)
+            self.restore_worker.failed.connect(self.restore_thread.quit)
+            self.restore_worker.finished.connect(self.restore_worker.deleteLater)
+            self.restore_worker.failed.connect(self.restore_worker.deleteLater)
+            self.restore_thread.finished.connect(self.restore_thread.deleteLater)
+            self.restore_thread.finished.connect(self.cleanup_restore_worker)
+            self.restore_thread.start()
+
+        def log_restore(self, message: str) -> None:
+            logger.info(message)
+            self.restore_log_text.append(message)
+
+        def on_restore_progress(self, message: str, current: int, total: int) -> None:
+            if total:
+                self.restore_progress_bar.setValue(max(0, min(100, int(current / total * 100))))
+            self.log_restore(message)
+
+        def on_restore_finished(self, result: object) -> None:
+            self.restore_progress_bar.setValue(100)
+            self.log_restore(
+                t(
+                    "restore_finished_summary",
+                    restored=result.restored,
+                    skipped=result.skipped_conflicts,
+                    unsafe=result.skipped_unsafe,
+                )
+            )
+
+        def on_restore_failed(self, message: str) -> None:
+            self.log_restore(f"Restore failed: {message}")
+            MessageBox(t("restore_failed"), message, self).exec()
+
+        def cleanup_restore_worker(self) -> None:
+            self.restore_thread = None
+            self.restore_worker = None
+            self.restore_button.setEnabled(self.restore_plan is not None)
+
+        def shutdown_workers(self) -> None:
+            if self.restore_thread and self.restore_thread.isRunning():
+                logger.info("Waiting for active restore worker before closing")
+                self.restore_thread.quit()
+                self.restore_thread.wait(1500)
+
         def retranslate(self) -> None:
             super().retranslate()
             if hasattr(self, "package_label"):
@@ -1829,15 +2094,24 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.open_package_button.setText(t("open_backup_file"))
                 self.choose_restore_button.setText(t("choose_restore_root"))
                 self.plan_button.setText(t("create_restore_plan"))
+                self.conflict_policy_label.setText(t("conflict_policy"))
+                self.conflict_policy_combo.setItemText(0, t("conflict_skip"))
+                self.conflict_policy_combo.setItemText(1, t("conflict_overwrite"))
+                self.restore_confirm_checkbox.setText(t("restore_confirm"))
+                self.restore_button.setText(t("execute_restore"))
                 self.restore_plan_label.setText(t("restore_plan"))
+                self.restore_progress_label.setText(t("restore_progress"))
                 self.plan_table.setHorizontalHeaderLabels(
                     [t("source"), t("destination"), t("state"), t("source_item")]
                 )
 
     class SettingsPage(Page):
-        def __init__(self, on_theme_changed, on_language_changed) -> None:
+        def __init__(
+            self, on_theme_changed, on_language_changed, on_developer_mode_changed
+        ) -> None:
             self.on_theme_changed = on_theme_changed
             self.on_language_changed = on_language_changed
+            self.on_developer_mode_changed = on_developer_mode_changed
             super().__init__("settings_title", "settings_subtitle")
             _, appearance_layout = self.add_card()
             self.appearance_label = SubtitleLabel()
@@ -1875,7 +2149,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             appearance_layout.addLayout(language_row)
             appearance_layout.addWidget(self.language_hint)
 
-            _, about_layout = self.add_card()
+            self.about_card, about_layout = self.add_card()
             self.about_label = SubtitleLabel()
             self.about_hint = CaptionLabel()
             self.about_hint.setWordWrap(True)
@@ -1922,15 +2196,41 @@ def run_app(auto_quit_ms: int | None = None) -> int:
 
             _, backup_layout = self.add_card()
             self.preferences_label = SubtitleLabel()
+            self.developer_mode_checkbox = CheckBox()
+            self.developer_mode_checkbox.setChecked(settings.developer_mode)
+            self.developer_mode_checkbox.stateChanged.connect(self.developer_mode_changed)
+            self.developer_mode_hint = CaptionLabel()
+            self.developer_mode_hint.setWordWrap(True)
             self.encrypt_default_checkbox = CheckBox()
             self.encrypt_default_checkbox.setChecked(settings.encrypt_by_default)
             self.encrypt_default_checkbox.stateChanged.connect(self.encrypt_default_changed)
             self.sensitive_confirm_checkbox = CheckBox()
             self.sensitive_confirm_checkbox.setChecked(settings.sensitive_confirm)
             self.sensitive_confirm_checkbox.stateChanged.connect(self.sensitive_confirm_changed)
+            self.temporary_root_label = BodyLabel()
+            self.temporary_root_input = LineEdit()
+            self.temporary_root_input.setReadOnly(True)
+            self.temporary_root_input.setMinimumHeight(38)
+            self.choose_temporary_root_button = PushButton(icon("FOLDER"), "")
+            self.choose_temporary_root_button.setMaximumWidth(180)
+            self.choose_temporary_root_button.clicked.connect(self.choose_temporary_root)
+            self.reset_temporary_root_button = PushButton(icon("SYNC", "CLEAR_SELECTION"), "")
+            self.reset_temporary_root_button.setMaximumWidth(170)
+            self.reset_temporary_root_button.clicked.connect(self.reset_temporary_root)
+            temporary_root_row = QHBoxLayout()
+            temporary_root_row.setSpacing(12)
+            temporary_root_row.addWidget(self.temporary_root_label)
+            temporary_root_row.addWidget(self.temporary_root_input, 1)
+            temporary_root_row.addWidget(self.choose_temporary_root_button)
+            temporary_root_row.addWidget(self.reset_temporary_root_button)
             backup_layout.addWidget(self.preferences_label)
+            backup_layout.addWidget(self.developer_mode_checkbox)
+            backup_layout.addWidget(self.developer_mode_hint)
             backup_layout.addWidget(self.encrypt_default_checkbox)
             backup_layout.addWidget(self.sensitive_confirm_checkbox)
+            backup_layout.addLayout(temporary_root_row)
+            self.root_layout.removeWidget(self.about_card)
+            self.root_layout.insertWidget(self.root_layout.count(), self.about_card)
             self.root_layout.addStretch(1)
             self.retranslate()
 
@@ -1958,6 +2258,24 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             settings.sensitive_confirm = self.sensitive_confirm_checkbox.isChecked()
             save_settings(settings)
 
+        def developer_mode_changed(self) -> None:
+            settings.developer_mode = self.developer_mode_checkbox.isChecked()
+            save_settings(settings)
+            self.on_developer_mode_changed(settings.developer_mode)
+
+        def choose_temporary_root(self) -> None:
+            directory = QFileDialog.getExistingDirectory(self, t("choose_temporary_root"))
+            if not directory:
+                return
+            settings.temporary_root = str(Path(directory))
+            save_settings(settings)
+            self.sync_from_settings()
+
+        def reset_temporary_root(self) -> None:
+            settings.temporary_root = None
+            save_settings(settings)
+            self.sync_from_settings()
+
         def sync_from_settings(self) -> None:
             if not hasattr(self, "theme_buttons"):
                 return
@@ -1976,6 +2294,12 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.sensitive_confirm_checkbox.blockSignals(True)
             self.sensitive_confirm_checkbox.setChecked(settings.sensitive_confirm)
             self.sensitive_confirm_checkbox.blockSignals(False)
+            self.developer_mode_checkbox.blockSignals(True)
+            self.developer_mode_checkbox.setChecked(settings.developer_mode)
+            self.developer_mode_checkbox.blockSignals(False)
+            self.temporary_root_input.setText(
+                settings.temporary_root or t("temporary_root_system")
+            )
 
         def retranslate(self) -> None:
             super().retranslate()
@@ -1994,8 +2318,13 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.license_button.setText(t("license_file"))
                 self.open_source_label.setText(t("open_source_projects"))
                 self.preferences_label.setText(t("backup_preferences"))
+                self.developer_mode_checkbox.setText(t("developer_mode"))
+                self.developer_mode_hint.setText(t("developer_mode_hint"))
                 self.encrypt_default_checkbox.setText(t("encrypt_by_default"))
                 self.sensitive_confirm_checkbox.setText(t("sensitive_confirm"))
+                self.temporary_root_label.setText(t("temporary_root"))
+                self.choose_temporary_root_button.setText(t("choose_temporary_root"))
+                self.reset_temporary_root_button.setText(t("reset_temporary_root"))
 
     class MainWindow(FluentWindow):
         def __init__(self) -> None:
@@ -2011,7 +2340,11 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.full = FullBackupPage()
             self.browser = PackageBrowserPage()
             self.restore = RestorePage()
-            self.settings_page = SettingsPage(self.change_theme, self.retranslate_pages)
+            self.settings_page = SettingsPage(
+                self.change_theme,
+                self.retranslate_pages,
+                self.change_developer_mode,
+            )
             self.pages = [
                 self.smart,
                 self.full,
@@ -2028,10 +2361,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             ]:
                 page.setObjectName(name)
 
-            self.addSubInterface(self.smart, icon("SYNC", "APPLICATION"), t("nav_smart"))
-            self.addSubInterface(self.full, icon("HARD_DISK", "FOLDER"), t("nav_full"))
-            self.addSubInterface(self.browser, icon("FOLDER", "APPLICATION"), t("nav_browser"))
-            self.addSubInterface(self.restore, icon("RETURN", "SYNC"), t("nav_restore"))
+            self.addSubInterface(self.smart, icon("UPDATE"), t("nav_smart"))
+            self.addSubInterface(self.full, icon("SAVE_AS"), t("nav_full"))
+            self.addSubInterface(self.browser, icon("ZIP_FOLDER"), t("nav_browser"))
+            self.addSubInterface(self.restore, icon("HISTORY"), t("nav_restore"))
             self.theme_nav_item = self.navigationInterface.addItem(
                 routeKey="themeAction",
                 icon=self.theme_action_icon(),
@@ -2054,27 +2387,45 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 t("nav_settings"),
                 position=NavigationItemPosition.BOTTOM,
             )
+            self.apply_developer_mode()
             self.restore_window_placement()
 
         def change_theme(self, value: str) -> None:
             apply_theme(value)
             self.update_nav_action_labels()
 
+        def change_developer_mode(self, enabled: bool) -> None:
+            settings.developer_mode = enabled
+            self.apply_developer_mode()
+
+        def apply_developer_mode(self) -> None:
+            enabled = settings.developer_mode
+            for route_key in ("fullBackupPage", "restorePage"):
+                nav_item = self.navigationInterface.widget(route_key)
+                if nav_item:
+                    nav_item.setVisible(enabled)
+            self.full.setEnabled(enabled)
+            self.restore.setEnabled(enabled)
+            if not enabled and self.stackedWidget.currentWidget() in (self.full, self.restore):
+                self.switchTo(self.smart)
+                self.navigationInterface.setCurrentItem(self.smart.objectName())
+            self.update_nav_action_labels()
+
         def theme_action_icon(self):
             return {
-                "auto": icon("SYNC", "BRUSH"),
-                "light": icon("BRIGHTNESS", "BRUSH"),
-                "dark": icon("QUIET_HOURS", "BRUSH"),
-            }.get(settings.theme, icon("BRUSH", "SETTING"))
+                "auto": icon("PALETTE"),
+                "light": icon("BRIGHTNESS"),
+                "dark": icon("QUIET_HOURS"),
+            }.get(settings.theme, icon("PALETTE"))
 
         def theme_action_text(self) -> str:
             return f"{t('nav_theme')} · {t(f'theme_{settings.theme}')}"
 
         def language_action_icon(self):
             return {
-                "zh_CN": icon("LANGUAGE", "FONT"),
-                "en_US": icon("GLOBE", "LANGUAGE"),
-            }.get(settings.language, icon("LANGUAGE", "FONT"))
+                "zh_CN": icon("LANGUAGE"),
+                "en_US": icon("GLOBE"),
+            }.get(settings.language, icon("LANGUAGE"))
 
         def language_action_text(self) -> str:
             language_name = SUPPORTED_LANGUAGES.get(settings.language, settings.language)
@@ -2140,13 +2491,9 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     frame.moveCenter(screen.availableGeometry().center())
                     self.move(frame.topLeft())
             self.ensure_window_visible()
-            target = next(
-                (page for page in self.pages if page.objectName() == settings.current_page),
-                self.smart,
-            )
             try:
-                self.switchTo(target)
-                self.navigationInterface.setCurrentItem(target.objectName())
+                self.switchTo(self.smart)
+                self.navigationInterface.setCurrentItem(self.smart.objectName())
             except Exception:
                 pass
 
@@ -2172,18 +2519,19 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 and self.smart.backup_thread.isRunning()
                 or self.full.full_backup_thread
                 and self.full.full_backup_thread.isRunning()
+                or self.restore.restore_thread
+                and self.restore.restore_thread.isRunning()
             ):
                 MessageBox(t("backup_running_title"), t("backup_running_body"), self).exec()
                 event.ignore()
                 return
             self.smart.shutdown_workers()
             self.full.shutdown_workers()
+            self.restore.shutdown_workers()
             settings.window_geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
             state = self.windowState()
             settings.window_state = str(state.value if hasattr(state, "value") else int(state))
-            current_widget = self.stackedWidget.currentWidget()
-            if current_widget:
-                settings.current_page = current_widget.objectName()
+            settings.current_page = self.smart.objectName()
             save_settings(settings)
             super().closeEvent(event)
 

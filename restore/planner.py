@@ -22,8 +22,12 @@ class RestorePlan:
     sensitive_item_ids: list[str]
 
 
-def build_restore_plan(package_path: Path, restore_root: Path) -> RestorePlan:
-    manifest = read_manifest(package_path)
+def build_restore_plan(
+    package_path: Path,
+    restore_root: Path,
+    temporary_root: Path | None = None,
+) -> RestorePlan:
+    manifest = read_manifest(package_path, temporary_root)
     operations: list[RestoreOperation] = []
     for file_entry in manifest.get("files", []):
         source_relative = file_entry["relative_path"]
