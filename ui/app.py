@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +61,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             QLabel,
             QListView,
             QListWidgetItem,
+            QMenu,
             QProgressBar,
             QSizePolicy,
             QStackedWidget,
@@ -272,11 +274,15 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             row: int,
             item: BackupItem,
             excluded_relative_paths: set[str],
+            included_relative_paths: set[str] | None,
         ) -> None:
             super().__init__()
             self.row = row
             self.item = item
             self.excluded_relative_paths = set(excluded_relative_paths)
+            self.included_relative_paths = (
+                set(included_relative_paths) if included_relative_paths is not None else None
+            )
 
         @Slot()
         def run(self) -> None:
@@ -285,6 +291,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     self.item,
                     limit=300,
                     excluded_relative_paths=self.excluded_relative_paths,
+                    included_relative_paths=self.included_relative_paths,
                 )
             except Exception as exc:
                 self.failed.emit(self.row, str(exc))
@@ -321,6 +328,12 @@ def run_app(auto_quit_ms: int | None = None) -> int:
         if not normalized:
             return bool(excluded_paths)
         return any(excluded.startswith(f"{normalized}/") for excluded in excluded_paths)
+
+    def has_included_child(relative_path: str, included_paths: set[str]) -> bool:
+        normalized = relative_path.strip("/")
+        if not normalized:
+            return bool(included_paths)
+        return any(included.startswith(f"{normalized}/") for included in included_paths)
 
     class Page(ScrollArea):
         def __init__(self, title_key: str, subtitle_key: str) -> None:
@@ -390,6 +403,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.selected_ids: set[str] = set()
             self.selected_app_names: set[str] = set()
             self.excluded_paths_by_item: dict[str, set[str]] = {}
+            self.included_paths_by_item: dict[str, set[str]] = {}
             self.item_by_row: dict[int, BackupItem] = {}
             self.app_by_row = {}
             self.preview_paths: list[Path] = []
@@ -472,10 +486,18 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.file_preview_tree.itemChanged.connect(self.on_preview_tree_item_changed)
             self.file_preview_tree.itemExpanded.connect(self.on_preview_tree_item_expanded)
             self.file_preview_tree.itemDoubleClicked.connect(self.open_preview_tree_item)
+            self.file_preview_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.file_preview_tree.customContextMenuRequested.connect(
+                lambda position: self.show_preview_context_menu(self.file_preview_tree, position)
+            )
             self.file_preview_list = ListWidget()
             self.file_preview_list.setMinimumWidth(360)
             self.file_preview_list.setMinimumHeight(460)
             self.file_preview_list.itemDoubleClicked.connect(self.open_preview_item)
+            self.file_preview_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.file_preview_list.customContextMenuRequested.connect(
+                lambda position: self.show_preview_context_menu(self.file_preview_list, position)
+            )
             self.file_preview_table = TableWidget()
             self.file_preview_table.setColumnCount(4)
             self.file_preview_table.setWordWrap(False)
@@ -483,6 +505,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.file_preview_table.setMinimumWidth(360)
             self.file_preview_table.setMinimumHeight(460)
             self.file_preview_table.itemDoubleClicked.connect(self.open_preview_table_item)
+            self.file_preview_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.file_preview_table.customContextMenuRequested.connect(
+                lambda position: self.show_preview_context_menu(self.file_preview_table, position)
+            )
             self.file_preview_icons = ListWidget()
             self.file_preview_icons.setViewMode(QListView.ViewMode.IconMode)
             self.file_preview_icons.setIconSize(QSize(64, 64))
@@ -493,6 +519,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.file_preview_icons.setMinimumWidth(360)
             self.file_preview_icons.setMinimumHeight(460)
             self.file_preview_icons.itemDoubleClicked.connect(self.open_preview_item)
+            self.file_preview_icons.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.file_preview_icons.customContextMenuRequested.connect(
+                lambda position: self.show_preview_context_menu(self.file_preview_icons, position)
+            )
             self.file_preview_stack.addWidget(self.file_preview_tree)
             self.file_preview_stack.addWidget(self.file_preview_list)
             self.file_preview_stack.addWidget(self.file_preview_table)
@@ -659,6 +689,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             else:
                 self.selected_ids = {item.id for item in self.items} if checked else set()
             self.excluded_paths_by_item.clear()
+            self.included_paths_by_item.clear()
             for row, item in self.item_by_row.items():
                 check_item = self.table.item(row, 0)
                 if check_item:
@@ -683,7 +714,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 return
             if item_id not in self.selected_ids:
                 state = Qt.CheckState.Unchecked
-            elif self.excluded_paths_by_item.get(item_id):
+            elif (
+                self.excluded_paths_by_item.get(item_id)
+                or self.included_paths_by_item.get(item_id)
+            ):
                 state = Qt.CheckState.PartiallyChecked
             else:
                 state = Qt.CheckState.Checked
@@ -694,8 +728,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             check_item.setCheckState(state)
             self.loading_table = False
 
-        def remove_exclusion_path(self, item_id: str, relative_path: str) -> None:
-            exclusions = self.excluded_paths_by_item.setdefault(item_id, set())
+        def remove_exclusions_under_path(self, item_id: str, relative_path: str) -> None:
+            exclusions = self.excluded_paths_by_item.get(item_id)
+            if exclusions is None:
+                return
             normalized = relative_path.strip("/")
             if not normalized:
                 exclusions.clear()
@@ -710,22 +746,82 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             if not exclusions:
                 self.excluded_paths_by_item.pop(item_id, None)
 
-        def add_exclusion_path(self, item_id: str, relative_path: str) -> None:
+        def select_preview_path(self, item_id: str, relative_path: str) -> None:
+            normalized = relative_path.strip("/")
+            if not normalized:
+                self.selected_ids.add(item_id)
+                self.excluded_paths_by_item.pop(item_id, None)
+                self.included_paths_by_item.pop(item_id, None)
+                return
+
+            inclusions = self.included_paths_by_item.get(item_id)
+            if inclusions is None and item_id in self.selected_ids:
+                self.remove_exclusions_under_path(item_id, normalized)
+                return
+
+            self.selected_ids.add(item_id)
+            inclusions = self.included_paths_by_item.setdefault(item_id, set())
+            has_selected_parent = any(
+                normalized.startswith(f"{included}/") for included in inclusions
+            )
+            if not has_selected_parent:
+                inclusions.difference_update(
+                    {
+                        included
+                        for included in inclusions
+                        if included == normalized or included.startswith(f"{normalized}/")
+                    }
+                )
+                inclusions.add(normalized)
+            self.remove_exclusions_under_path(item_id, normalized)
+
+        def deselect_preview_path(self, item_id: str, relative_path: str) -> None:
             normalized = relative_path.strip("/")
             if not normalized:
                 self.selected_ids.discard(item_id)
                 self.excluded_paths_by_item.pop(item_id, None)
+                self.included_paths_by_item.pop(item_id, None)
                 return
-            self.selected_ids.add(item_id)
-            exclusions = self.excluded_paths_by_item.setdefault(item_id, set())
-            exclusions.difference_update(
-                {
-                    excluded
-                    for excluded in exclusions
-                    if excluded == normalized or excluded.startswith(f"{normalized}/")
-                }
+
+            inclusions = self.included_paths_by_item.get(item_id)
+            if inclusions is None:
+                self.selected_ids.add(item_id)
+                exclusions = self.excluded_paths_by_item.setdefault(item_id, set())
+                exclusions.difference_update(
+                    {
+                        excluded
+                        for excluded in exclusions
+                        if excluded == normalized or excluded.startswith(f"{normalized}/")
+                    }
+                )
+                exclusions.add(normalized)
+                return
+
+            has_selected_parent = any(
+                normalized.startswith(f"{included}/") for included in inclusions
             )
-            exclusions.add(normalized)
+            if has_selected_parent:
+                exclusions = self.excluded_paths_by_item.setdefault(item_id, set())
+                exclusions.difference_update(
+                    {
+                        excluded
+                        for excluded in exclusions
+                        if excluded == normalized or excluded.startswith(f"{normalized}/")
+                    }
+                )
+                exclusions.add(normalized)
+            else:
+                inclusions.difference_update(
+                    {
+                        included
+                        for included in inclusions
+                        if included == normalized or included.startswith(f"{normalized}/")
+                    }
+                )
+            if not inclusions:
+                self.selected_ids.discard(item_id)
+                self.included_paths_by_item.pop(item_id, None)
+                self.excluded_paths_by_item.pop(item_id, None)
 
         def refresh_tree_ancestor_states(self, tree_item: QTreeWidgetItem) -> None:
             parent = tree_item.parent()
@@ -772,11 +868,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     tree_item.setCheckState(Qt.CheckState.Unchecked)
                     self.loading_preview_tree = False
                     return
-                self.selected_ids.add(item_id)
-                self.remove_exclusion_path(item_id, relative_path)
+                self.select_preview_path(item_id, relative_path)
                 self.set_tree_item_check_state(tree_item, Qt.CheckState.Checked)
             elif state == Qt.CheckState.Unchecked:
-                self.add_exclusion_path(item_id, relative_path)
+                self.deselect_preview_path(item_id, relative_path)
                 self.set_tree_item_check_state(tree_item, Qt.CheckState.Unchecked)
             self.loading_preview_tree = False
             self.refresh_tree_ancestor_states(tree_item)
@@ -957,9 +1052,11 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     return
                 self.selected_ids.add(item.id)
                 self.excluded_paths_by_item.pop(item.id, None)
+                self.included_paths_by_item.pop(item.id, None)
             elif check_state == Qt.CheckState.Unchecked:
                 self.selected_ids.discard(item.id)
                 self.excluded_paths_by_item.pop(item.id, None)
+                self.included_paths_by_item.pop(item.id, None)
             else:
                 self.selected_ids.add(item.id)
             self.update_selection_label()
@@ -992,6 +1089,22 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             if item.id not in self.selected_ids:
                 return Qt.CheckState.Unchecked
             excluded = self.excluded_paths_by_item.get(item.id, set())
+            included = self.included_paths_by_item.get(item.id)
+            normalized = relative_path.strip("/")
+            if included:
+                is_included = any(
+                    normalized == selected or normalized.startswith(f"{selected}/")
+                    for selected in included
+                )
+                if is_included:
+                    if is_excluded_relative(relative_path, excluded):
+                        return Qt.CheckState.Unchecked
+                    if has_excluded_child(relative_path, excluded):
+                        return Qt.CheckState.PartiallyChecked
+                    return Qt.CheckState.Checked
+                if has_included_child(relative_path, included):
+                    return Qt.CheckState.PartiallyChecked
+                return Qt.CheckState.Unchecked
             if is_excluded_relative(relative_path, excluded):
                 return Qt.CheckState.Unchecked
             if has_excluded_child(relative_path, excluded):
@@ -1120,6 +1233,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 row,
                 item,
                 self.excluded_paths_by_item.get(item.id, set()),
+                self.included_paths_by_item.get(item.id),
             )
             self.preview_worker.moveToThread(self.preview_thread)
             self.preview_thread.started.connect(self.preview_worker.run)
@@ -1228,6 +1342,39 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             if path:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
+        def show_preview_context_menu(self, view, position) -> None:
+            entry = view.itemAt(position)
+            path = entry.data(0, PATH_ROLE) if view is self.file_preview_tree and entry else None
+            if entry and view is not self.file_preview_tree:
+                path = entry.data(PATH_ROLE)
+            if not path:
+                return
+            menu = QMenu(view)
+            explorer_action = menu.addAction(t("open_in_file_explorer"))
+            explorer_action.triggered.connect(lambda: self.open_in_file_explorer(str(path)))
+            menu.exec(view.viewport().mapToGlobal(position))
+
+        def open_in_file_explorer(self, path_text: str) -> None:
+            path = Path(path_text)
+            directory = path if path.is_dir() else path.parent
+            try:
+                if os.name == "nt":
+                    arguments = (
+                        ["explorer.exe", f"/select,{path}"]
+                        if path.is_file()
+                        else ["explorer.exe", str(directory)]
+                    )
+                    subprocess.Popen(
+                        arguments,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                else:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+                logger.info("Opened in file explorer: %s", path)
+            except OSError:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
         def update_selection_label(self) -> None:
             total = len(self.items)
             selected = len(self.selected_ids)
@@ -1279,6 +1426,11 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 for item_id, paths in self.excluded_paths_by_item.items()
                 if paths
             }
+            item_inclusions = {
+                item_id: set(paths)
+                for item_id, paths in self.included_paths_by_item.items()
+                if paths
+            }
             temporary_root = configured_temporary_root()
             self.smart_log_text.clear()
             self.log_smart(t("backup_starting"))
@@ -1296,6 +1448,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     encryption_password=password,
                     selected_application_names=selected_app_names,
                     item_exclusions=item_exclusions,
+                    item_inclusions=item_inclusions,
                     output_path=output_path,
                     progress=progress,
                     temporary_root=temporary_root,

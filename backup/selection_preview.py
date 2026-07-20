@@ -19,9 +19,14 @@ def preview_item_files(
     item: BackupItem,
     limit: int = 500,
     excluded_relative_paths: set[str] | None = None,
+    included_relative_paths: set[str] | None = None,
 ) -> list[SelectionPreviewFile]:
     files: list[SelectionPreviewFile] = []
-    for path in iter_files(item.path, excluded_relative_paths=excluded_relative_paths or set()):
+    for path in iter_files(
+        item.path,
+        excluded_relative_paths=excluded_relative_paths or set(),
+        included_relative_paths=included_relative_paths,
+    ):
         try:
             size = path.stat().st_size
         except OSError:

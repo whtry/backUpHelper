@@ -30,10 +30,28 @@ def is_relative_path_excluded(path: Path, excluded_relative_paths: Iterable[str]
     return False
 
 
+def is_relative_path_included(
+    path: Path,
+    included_relative_paths: Iterable[str] | None,
+) -> bool:
+    """Return whether a path is covered by an explicit file or folder selection."""
+    if included_relative_paths is None:
+        return True
+    normalized = path.as_posix().strip("/")
+    for included in included_relative_paths:
+        included_normalized = included.strip("/")
+        if not included_normalized:
+            return True
+        if normalized == included_normalized or normalized.startswith(f"{included_normalized}/"):
+            return True
+    return False
+
+
 def iter_files(
     root: Path,
     exclude_patterns: Iterable[str] = DEFAULT_EXCLUDES,
     excluded_relative_paths: Iterable[str] = (),
+    included_relative_paths: Iterable[str] | None = None,
 ) -> Iterator[Path]:
     if root.is_file():
         if not should_exclude(root, exclude_patterns):
@@ -49,6 +67,8 @@ def iter_files(
         except ValueError:
             relative = Path(path.name)
         if is_relative_path_excluded(relative, excluded_relative_paths):
+            continue
+        if not is_relative_path_included(relative, included_relative_paths):
             continue
         if path.is_file() and not should_exclude(path, exclude_patterns):
             yield path

@@ -69,11 +69,13 @@ def _stage_files(
     stage_dir: Path,
     selected_items: list[BackupItem],
     item_exclusions: dict[str, set[str]] | None = None,
+    item_inclusions: dict[str, set[str]] | None = None,
     progress: ProgressCallback | None = None,
 ) -> list[ManifestFile]:
     files: list[ManifestFile] = []
     data_dir = stage_dir / "data"
     item_exclusions = item_exclusions or {}
+    item_inclusions = item_inclusions or {}
     total = max(1, len(selected_items))
     for item_index, item in enumerate(selected_items, start=1):
         _emit(progress, f"Scanning {item.name}: {item.path}", item_index - 1, total)
@@ -84,6 +86,7 @@ def _stage_files(
         for source in iter_files(
             item.path,
             excluded_relative_paths=item_exclusions.get(item.id, set()),
+            included_relative_paths=item_inclusions.get(item.id),
         ):
             rel_from_source = source.relative_to(source_base)
             target = item_root / rel_from_source
@@ -316,12 +319,19 @@ def create_stage_directory(
     include_system_inventory: bool = True,
     selected_application_names: set[str] | None = None,
     item_exclusions: dict[str, set[str]] | None = None,
+    item_inclusions: dict[str, set[str]] | None = None,
     progress: ProgressCallback | None = None,
 ) -> Path:
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     stage_dir = destination / f"backUpHelper-{timestamp}"
     stage_dir.mkdir(parents=True, exist_ok=False)
-    files = _stage_files(stage_dir, selected_items, item_exclusions, progress)
+    files = _stage_files(
+        stage_dir,
+        selected_items,
+        item_exclusions,
+        item_inclusions,
+        progress,
+    )
     applications = _write_supporting_inventory(
         stage_dir,
         include_system_inventory,
@@ -344,6 +354,11 @@ def create_stage_directory(
                 for item_id, paths in (item_exclusions or {}).items()
                 if paths
             },
+            "item_inclusions": {
+                item_id: sorted(paths)
+                for item_id, paths in (item_inclusions or {}).items()
+                if paths
+            },
             "note": "File-level packages are not bootable disk images.",
         },
     )
@@ -361,6 +376,7 @@ def create_backup_package(
     encryption_password: str | None = None,
     selected_application_names: set[str] | None = None,
     item_exclusions: dict[str, set[str]] | None = None,
+    item_inclusions: dict[str, set[str]] | None = None,
     output_path: Path | None = None,
     progress: ProgressCallback | None = None,
     temporary_root: Path | None = None,
@@ -380,6 +396,7 @@ def create_backup_package(
             include_system_inventory=include_system_inventory,
             selected_application_names=selected_application_names,
             item_exclusions=item_exclusions,
+            item_inclusions=item_inclusions,
             progress=progress,
         )
         if archive_format == ArchiveFormat.DIRECTORY:

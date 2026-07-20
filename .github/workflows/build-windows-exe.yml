@@ -86,13 +86,3 @@ jobs:
           name: ${{ env.PACKAGE_NAME }}
           path: ${{ env.PACKAGE_NAME }}.zip
           if-no-files-found: error
-
-  windows-x86-compatibility:
-    name: Windows x86 compatibility note
-    runs-on: windows-2022
-    steps:
-      - name: Explain current x86 status
-        run: |
-          "Windows x86 32-bit GUI build is intentionally skipped."
-          "The project uses PySide6, and current PySide6 wheels are published for Windows x64 and Windows ARM64, not win32."
-          "Keep the package name reserved as: backUpHelper-<version>-windows-win-x86.zip if PySide6 win32 support is added later."

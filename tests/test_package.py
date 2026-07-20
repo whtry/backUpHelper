@@ -88,6 +88,37 @@ def test_create_package_respects_item_exclusions(tmp_path: Path) -> None:
     assert manifest["metadata"]["item_exclusions"] == {"demo": ["drop"]}
 
 
+def test_create_package_respects_explicit_item_inclusions(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    include = source / "include"
+    exclude = source / "exclude"
+    include.mkdir(parents=True)
+    exclude.mkdir()
+    (include / "keep.txt").write_text("keep", encoding="utf-8")
+    (exclude / "skip.txt").write_text("skip", encoding="utf-8")
+    item = BackupItem(
+        id="demo",
+        name="Demo App",
+        category="Test",
+        path=source,
+        reason="Test partial folder backup.",
+    )
+
+    package = create_backup_package(
+        tmp_path / "out",
+        [item],
+        ArchiveFormat.DIRECTORY,
+        include_system_inventory=False,
+        item_inclusions={"demo": {"include"}},
+    )
+    manifest = read_manifest(package)
+    paths = {file["relative_path"] for file in manifest["files"]}
+
+    assert "data/demo/include/keep.txt" in paths
+    assert "data/demo/exclude/skip.txt" not in paths
+    assert manifest["metadata"]["item_inclusions"] == {"demo": ["include"]}
+
+
 def test_create_iso_package(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
