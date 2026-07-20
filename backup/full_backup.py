@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 from backup.package import create_backup_package
 from core.models import ArchiveFormat, BackupItem, BackupMode, RiskLevel
@@ -35,6 +36,7 @@ def create_folder_backup(
     output_path: Path | None = None,
     progress=None,
     temporary_root: Path | None = None,
+    cancel_event: Event | None = None,
 ) -> Path:
     item = _full_backup_item(
         target,
@@ -51,6 +53,7 @@ def create_folder_backup(
         output_path=output_path,
         progress=progress,
         temporary_root=temporary_root,
+        cancel_event=cancel_event,
     )
 
 
@@ -61,6 +64,7 @@ def create_volume_iso_backup(
     output_path: Path | None = None,
     progress=None,
     temporary_root: Path | None = None,
+    cancel_event: Event | None = None,
 ) -> Path:
     target = FullBackupTarget(path=volume_root, label=str(volume_root), is_volume_root=True)
     item = _full_backup_item(
@@ -78,6 +82,7 @@ def create_volume_iso_backup(
         output_path=output_path,
         progress=progress,
         temporary_root=temporary_root,
+        cancel_event=cancel_event,
     )
 
 
@@ -89,6 +94,7 @@ def create_file_level_full_backup(
     output_path: Path | None = None,
     progress=None,
     temporary_root: Path | None = None,
+    cancel_event: Event | None = None,
 ) -> Path:
     if target.is_volume_root and archive_format == ArchiveFormat.ISO:
         return create_volume_iso_backup(
@@ -98,6 +104,7 @@ def create_file_level_full_backup(
             output_path,
             progress,
             temporary_root,
+            cancel_event,
         )
     return create_folder_backup(
         target,
@@ -107,4 +114,5 @@ def create_file_level_full_backup(
         output_path,
         progress,
         temporary_root,
+        cancel_event,
     )

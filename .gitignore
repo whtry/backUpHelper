@@ -22,3 +22,6 @@ tools/7zip/
 *.vhdx
 *.wim
 backUpHelper-*/
+/settings.json
+/settings.tmp
+/.back_up_helper_config_location.json

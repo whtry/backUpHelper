@@ -37,7 +37,7 @@ back-up-helper = "main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["adapters", "backup", "core", "inventory", "preview", "restore", "ui"]
-include = ["main.py", "desktop.py", "app_info.py", "assets/app-icon.svg"]
+include = ["main.py", "desktop.py", "app_info.py", "assets/app-icon.svg", "assets/alipay.jpg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

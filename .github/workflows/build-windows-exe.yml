@@ -72,6 +72,7 @@ jobs:
             --exclude-module colorthief `
             --exclude-module scipy `
             --add-data "assets/app-icon.svg;assets" `
+            --add-data "assets/alipay.jpg;assets" `
             --add-data "tools/7zip;tools/7zip" `
             desktop.py
 
@@ -88,14 +89,15 @@ jobs:
           Copy-Item "dist/backUpHelper/*" "$packageName" -Recurse
           Copy-Item "README.md" "$packageName/README.md"
           Copy-Item "LICENSE" "$packageName/LICENSE"
-          Compress-Archive -Path "$packageName/*" -DestinationPath "$packageName.zip" -Force
-          $archiveSize = (Get-Item "$packageName.zip").Length
-          "Release archive size: $([math]::Round($archiveSize / 1MB, 1)) MiB"
+          $packageSize = (Get-ChildItem "$packageName" -Recurse -File | Measure-Object Length -Sum).Sum
+          "Artifact folder size: $([math]::Round($packageSize / 1MB, 1)) MiB"
           "PACKAGE_NAME=$packageName" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PACKAGE_NAME }}
-          path: ${{ env.PACKAGE_NAME }}.zip
+          # upload-artifact creates the download ZIP itself. Upload the release
+          # folder directly so the downloaded archive contains one folder, not a ZIP inside a ZIP.
+          path: ${{ env.PACKAGE_NAME }}
           if-no-files-found: error

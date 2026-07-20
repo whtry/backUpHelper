@@ -63,8 +63,26 @@ TRANSLATIONS = {
         "choose_backup_destination": "选择备份保存位置",
         "backup_created": "备份已创建",
         "backup_failed": "备份失败",
+        "backup_cancelled": "操作已停止",
+        "backup_cancelled_body": "已停止当前任务，并清理未完成的输出与临时文件。",
+        "stop": "停止",
+        "stop_operation": "停止当前任务",
+        "stop_operation_body": "停止后将删除未完成的备份输出和临时缓存。此操作无法撤销。",
+        "open_containing_folder": "打开所在目录",
+        "close": "关闭",
         "backup_starting": "开始创建备份...",
         "backup_progress": "备份进度",
+        "space_checking": "正在估算备份所需空间...",
+        "backup_space_title": "确认备份空间",
+        "backup_space_body": (
+            "将备份 {file_count} 个文件，源数据约 {source_size}。\n"
+            "输出位置峰值需要约 {output_required}，当前可用 {output_free}。\n"
+            "临时工作目录峰值需要约 {temporary_required}，当前可用 {temporary_free}。\n"
+            "ZIP、7z 和 ISO 会直接读取源文件，不会再复制一份完整的源数据到临时目录。"
+        ),
+        "insufficient_space": "可用空间不足",
+        "continue_backup": "继续备份",
+        "cancel": "取消",
         "backup_running_title": "备份正在运行",
         "backup_running_body": "请等待当前备份完成后再关闭窗口。",
         "missing_password": "密码缺失",
@@ -106,6 +124,9 @@ TRANSLATIONS = {
         "preview": "预览",
         "filter_files": "筛选文件",
         "extract_selected_entry": "导出选中文件",
+        "extract_backup_package": "解压备份包",
+        "open_package_location": "打开备份包所在地",
+        "open_with_system_default": "使用系统默认方式打开",
         "image_preview_failed": "无法预览此图片，请导出后使用本地应用打开。",
         "cannot_open_package": "无法打开备份包",
         "created_at": "创建时间",
@@ -113,6 +134,36 @@ TRANSLATIONS = {
         "format": "格式",
         "item_count": "备份项",
         "file_count": "文件数",
+        "size": "大小",
+        "version": "版本",
+        "publisher": "发布者",
+        "package_size": "包内文件大小",
+        "package_overview": "备份包概览",
+        "package_applications": "已安装应用清单",
+        "applications_found": "显示 {shown}/{total} 个应用",
+        "applications_count": "应用: {count}",
+        "package_contents": "备份内容",
+        "content_category": "内容分类",
+        "browser_section": "查看内容",
+        "package_data": "用户数据与配置",
+        "package_inventory": "应用与环境清单",
+        "package_registry_restore": "注册表与恢复说明",
+        "package_metadata": "恢复辅助文件",
+        "registry_exports": "注册表导出",
+        "restore_notes": "恢复说明",
+        "available": "可用",
+        "select_file_to_preview": "从左侧选择一个文件以查看内容。",
+        "preview_showing": "显示 {shown}/{total} 个文件；可使用筛选定位更多文件",
+        "migrated_data": "迁移数据项",
+        "migrated_data_summary": "共 {count} 个已选数据来源；点击一行可定位对应文件",
+        "software": "所属软件",
+        "source_path": "原始路径",
+        "conda_environments": "Conda 环境",
+        "conda_environments_found": "发现 {count} 个环境计划",
+        "environment": "环境名称",
+        "environment_path": "环境路径",
+        "restore_command": "恢复命令",
+        "exported_files": "已导出文件",
         "restore_title": "恢复",
         "restore_subtitle": "先生成恢复预案，确认写入路径、冲突和敏感项后再执行。",
         "backup_package": "备份包",
@@ -164,7 +215,20 @@ TRANSLATIONS = {
         "project_home": "项目主页",
         "license_file": "许可证文件",
         "open_source_projects": "本项目使用的开源项目",
+        "support_project": "支持项目",
+        "support_project_hint": (
+            "如果 backUpHelper 对你的迁移工作有所帮助，欢迎使用支付宝扫码自愿赞助。"
+            "每一份支持都会用于持续维护、兼容性测试和功能改进。"
+        ),
         "backup_preferences": "备份偏好",
+        "backup_security": "备份与安全",
+        "storage": "存储与临时文件",
+        "runtime_logs": "运行与日志",
+        "runtime_logs_hint": "启用后，会将本次及之后的程序运行日志写入本机日志目录，便于排查问题。",
+        "persist_runtime_logs": "自动保存运行日志",
+        "runtime_log_directory": "日志保存位置",
+        "open_log_directory": "打开日志目录",
+        "advanced": "高级功能",
         "developer_mode": "开发者模式",
         "developer_mode_hint": (
             "开启完整备份和恢复等实验性功能。它们可能写入大量数据或覆盖已有文件，"
@@ -176,6 +240,10 @@ TRANSLATIONS = {
         "temporary_root_system": "使用 Windows 系统临时目录",
         "choose_temporary_root": "选择临时目录",
         "reset_temporary_root": "恢复系统默认",
+        "settings_directory": "配置文件目录",
+        "choose_settings_directory": "选择配置目录",
+        "reset_settings_directory": "使用应用目录",
+        "settings_directory_update_failed": "无法将配置文件保存到所选目录。请确认该目录可写。",
     },
     "en_US": {
         "app_title": "backUpHelper",
@@ -241,8 +309,32 @@ TRANSLATIONS = {
         "choose_backup_destination": "Choose backup destination",
         "backup_created": "Backup created",
         "backup_failed": "Backup failed",
+        "backup_cancelled": "Operation stopped",
+        "backup_cancelled_body": (
+            "The current task was stopped and incomplete output and temporary files were removed."
+        ),
+        "stop": "Stop",
+        "stop_operation": "Stop current task",
+        "stop_operation_body": (
+            "Stopping removes incomplete backup output and temporary cache files. "
+            "This cannot be undone."
+        ),
+        "open_containing_folder": "Open containing folder",
+        "close": "Close",
         "backup_starting": "Starting backup...",
         "backup_progress": "Backup progress",
+        "space_checking": "Estimating backup space...",
+        "backup_space_title": "Confirm backup space",
+        "backup_space_body": (
+            "{file_count} files selected, with about {source_size} of source data.\n"
+            "The output location needs up to {output_required}; {output_free} is available.\n"
+            "The temporary-work location needs up to {temporary_required}; "
+            "{temporary_free} is available.\n"
+            "ZIP, 7z, and ISO read the source files directly and do not stage a full data copy."
+        ),
+        "insufficient_space": "Insufficient free space",
+        "continue_backup": "Continue backup",
+        "cancel": "Cancel",
         "backup_running_title": "Backup is running",
         "backup_running_body": "Wait for the current backup to finish before closing the window.",
         "missing_password": "Missing password",
@@ -280,6 +372,9 @@ TRANSLATIONS = {
         "preview": "Preview",
         "filter_files": "Filter files",
         "extract_selected_entry": "Extract selected file",
+        "extract_backup_package": "Extract backup package",
+        "open_package_location": "Open package location",
+        "open_with_system_default": "Open with system default",
         "image_preview_failed": "This image cannot be previewed. Extract it and open it locally.",
         "cannot_open_package": "Cannot open package",
         "created_at": "Created",
@@ -287,6 +382,36 @@ TRANSLATIONS = {
         "format": "Format",
         "item_count": "Items",
         "file_count": "Files",
+        "size": "Size",
+        "version": "Version",
+        "publisher": "Publisher",
+        "package_size": "Package file size",
+        "package_overview": "Package overview",
+        "package_applications": "Installed applications",
+        "applications_found": "Showing {shown}/{total} applications",
+        "applications_count": "Apps: {count}",
+        "package_contents": "Backup contents",
+        "content_category": "Category",
+        "browser_section": "View",
+        "package_data": "User data and configuration",
+        "package_inventory": "Application and environment inventory",
+        "package_registry_restore": "Registry and restore notes",
+        "package_metadata": "Restore support files",
+        "registry_exports": "Registry exports",
+        "restore_notes": "Restore notes",
+        "available": "Available",
+        "select_file_to_preview": "Select a file on the left to inspect its contents.",
+        "preview_showing": "Showing {shown}/{total} files; use search to locate more files",
+        "migrated_data": "Migrated data sources",
+        "migrated_data_summary": "{count} selected data sources; click a row to locate its files",
+        "software": "Software",
+        "source_path": "Original path",
+        "conda_environments": "Conda environments",
+        "conda_environments_found": "{count} environment plans found",
+        "environment": "Environment",
+        "environment_path": "Environment path",
+        "restore_command": "Restore command",
+        "exported_files": "Exported files",
         "restore_title": "Restore",
         "restore_subtitle": "Generate a dry-run plan before writing files or registry entries.",
         "backup_package": "Backup package",
@@ -340,7 +465,23 @@ TRANSLATIONS = {
         "project_home": "Project home",
         "license_file": "License file",
         "open_source_projects": "Open-source projects used by this app",
+        "support_project": "Support the project",
+        "support_project_hint": (
+            "If backUpHelper helps with your migration, voluntary Alipay support is welcome. "
+            "Every contribution helps with maintenance, compatibility testing, and improvements."
+        ),
         "backup_preferences": "Backup preferences",
+        "backup_security": "Backup and security",
+        "storage": "Storage and temporary files",
+        "runtime_logs": "Runtime and logs",
+        "runtime_logs_hint": (
+            "When enabled, this and future application runs write logs to the local "
+            "log directory for troubleshooting."
+        ),
+        "persist_runtime_logs": "Save runtime logs automatically",
+        "runtime_log_directory": "Log directory",
+        "open_log_directory": "Open log directory",
+        "advanced": "Advanced features",
         "developer_mode": "Developer mode",
         "developer_mode_hint": (
             "Enable experimental Full backup and Restore features. They may write large amounts "
@@ -352,6 +493,13 @@ TRANSLATIONS = {
         "temporary_root_system": "Use the Windows system temporary directory",
         "choose_temporary_root": "Choose temporary directory",
         "reset_temporary_root": "Use system default",
+        "settings_directory": "Configuration directory",
+        "choose_settings_directory": "Choose configuration directory",
+        "reset_settings_directory": "Use application directory",
+        "settings_directory_update_failed": (
+            "Unable to save the configuration file in the selected directory. "
+            "Make sure the directory is writable."
+        ),
     },
 }
 

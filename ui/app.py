@@ -1,26 +1,50 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 from adapters.catalog import discover_backup_items
 from backup.full_backup import FullBackupTarget, create_folder_backup, create_volume_iso_backup
-from backup.package import create_backup_package
+from backup.package import (
+    BackupSpaceCheck,
+    check_backup_space,
+    create_backup_package,
+    estimate_backup_space,
+    format_bytes,
+)
 from backup.selection_preview import preview_item_files
 from backup.volumes import list_windows_volumes
+from core.cancellation import OperationCancelledError
+from core.logging_config import configure_application_logging, runtime_log_directory
 from core.models import ArchiveFormat, BackupItem
+from core.temporary import prepare_temporary_root
 from inventory.icons import normalize_icon_path
 from inventory.installed_apps import list_installed_applications
 from preview.file_preview import IMAGE_EXTENSIONS, preview_entry_text
-from preview.package_reader import copy_entry_to, list_entries, read_entry_bytes, read_manifest
+from preview.package_reader import (
+    copy_entry_to,
+    extract_package_to,
+    list_entries,
+    read_entry_bytes,
+    read_manifest,
+)
 from restore.executor import execute_restore_plan
 from restore.planner import build_restore_plan
 from ui.i18n import SUPPORTED_LANGUAGES, tr
-from ui.settings_state import load_settings, save_settings
+from ui.settings_state import (
+    load_settings,
+    reset_settings_directory,
+    save_settings,
+    set_settings_directory,
+    settings_directory,
+)
 
 
 def _missing_ui_message() -> int:
@@ -34,6 +58,7 @@ def _missing_ui_message() -> int:
 
 def run_app(auto_quit_ms: int | None = None) -> int:
     try:
+        from PySide6 import __version__ as pyside_version
         from PySide6.QtCore import (
             QByteArray,
             QEvent,
@@ -46,6 +71,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             QUrl,
             Signal,
             Slot,
+            qVersion,
         )
         from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap
         from PySide6.QtWidgets import (
@@ -97,17 +123,17 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             setTheme,
             setThemeColor,
         )
+
+        from ui.archive_file_preview import ArchiveFilePreviewPanel
     except ImportError:
         return _missing_ui_message()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        stream=sys.stdout,
-    )
     settings = load_settings()
+    configured_log_root = Path(settings.temporary_root) if settings.temporary_root else None
+    configure_application_logging(settings.persist_runtime_logs, configured_log_root)
     logger = logging.getLogger("backUpHelper")
     logger.info("Starting backUpHelper UI")
+    logger.info("Qt UI environment | PySide6=%s | Qt=%s", pyside_version, qVersion())
     PATH_ROLE = int(Qt.ItemDataRole.UserRole)
     ITEM_ID_ROLE = PATH_ROLE + 1
     RELATIVE_PATH_ROLE = PATH_ROLE + 2
@@ -183,14 +209,22 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             path = path.with_suffix("." + selected_format.value)
         return path, selected_format
 
-    def app_icon_path() -> Path:
+    def asset_path(name: str) -> Path:
         bundle_root = getattr(sys, "_MEIPASS", None)
         if bundle_root:
-            return Path(bundle_root) / "assets" / "app-icon.svg"
-        return Path(__file__).resolve().parents[1] / "assets" / "app-icon.svg"
+            return Path(bundle_root) / "assets" / name
+        return Path(__file__).resolve().parents[1] / "assets" / name
+
+    def app_icon_path() -> Path:
+        return asset_path("app-icon.svg")
 
     def open_url(url: str) -> None:
+        logger.info("Opening external URL: %s", url)
         QDesktopServices.openUrl(QUrl(url))
+
+    def open_local_path(path: Path, action: str) -> None:
+        logger.info("%s: %s", action, path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def apply_theme(value: str) -> None:
         theme = {
@@ -202,6 +236,20 @@ def run_app(auto_quit_ms: int | None = None) -> int:
 
     def configured_temporary_root() -> Path | None:
         return Path(settings.temporary_root) if settings.temporary_root else None
+
+    def show_backup_created(parent: QWidget, package: object) -> None:
+        package_path = Path(str(package))
+        dialog = MessageBox(t("backup_created"), str(package_path), parent)
+        dialog.yesButton.setText(t("open_containing_folder"))
+        dialog.cancelButton.setText(t("close"))
+        if dialog.exec():
+            open_local_path(package_path.parent, "Opening backup output directory")
+
+    def confirm_stop_operation(parent: QWidget) -> bool:
+        dialog = MessageBox(t("stop_operation"), t("stop_operation_body"), parent)
+        dialog.yesButton.setText(t("stop"))
+        dialog.cancelButton.setText(t("cancel"))
+        return bool(dialog.exec())
 
     def apply_app_style(app: QApplication) -> None:
         font = QFont("Microsoft YaHei UI")
@@ -299,19 +347,56 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 return
             self.finished.emit(self.row, files)
 
+    class InteractionLogFilter(QObject):
+        """Records deliberate mouse interactions while persistent logging is enabled."""
+
+        def eventFilter(self, watched, event) -> bool:
+            if not settings.persist_runtime_logs:
+                return False
+            event_type = event.type()
+            if event_type not in (QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonDblClick):
+                return False
+            description = self._describe_widget(watched)
+            if description:
+                verb = "double-click" if event_type == QEvent.Type.MouseButtonDblClick else "click"
+                logger.info("UI %s: %s", verb, description)
+            return False
+
+        @staticmethod
+        def _describe_widget(watched) -> str | None:
+            widget = watched if isinstance(watched, QWidget) else None
+            while widget is not None:
+                text = getattr(widget, "text", None)
+                value = text() if callable(text) else ""
+                if isinstance(value, str) and value.strip():
+                    return f"{widget.metaObject().className()} [{value.strip()[:160]}]"
+                object_name = widget.objectName()
+                if object_name:
+                    return f"{widget.metaObject().className()} [{object_name}]"
+                widget = widget.parentWidget()
+            return None
+
     class BackupJobWorker(QObject):
         progress = Signal(str, int, int)
         finished = Signal(object)
         failed = Signal(str)
+        cancelled = Signal(str)
 
         def __init__(self, task) -> None:
             super().__init__()
             self.task = task
+            self.cancel_event = Event()
+
+        def cancel(self) -> None:
+            self.cancel_event.set()
 
         @Slot()
         def run(self) -> None:
             try:
-                result = self.task(self.progress.emit)
+                result = self.task(self.progress.emit, self.cancel_event)
+            except OperationCancelledError as exc:
+                self.cancelled.emit(str(exc))
+                return
             except Exception as exc:
                 self.failed.emit(str(exc))
                 return
@@ -419,6 +504,9 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.apps_worker: InstalledAppsWorker | None = None
             self.backup_thread: QThread | None = None
             self.backup_worker: BackupJobWorker | None = None
+            self.preflight_thread: QThread | None = None
+            self.preflight_worker: BackupJobWorker | None = None
+            self.preflight_build_task = None
             self.select_all_apps_after_load = False
             self.preview_timer = QTimer(self)
             self.preview_timer.setSingleShot(True)
@@ -596,12 +684,17 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             backup_button.setMinimumHeight(46)
             backup_button.clicked.connect(self.create_backup)
             self.backup_button = backup_button
+            self.stop_backup_button = PushButton(icon("CANCEL"), "")
+            self.stop_backup_button.setMaximumWidth(120)
+            self.stop_backup_button.setEnabled(False)
+            self.stop_backup_button.clicked.connect(self.request_stop_smart_backup)
             control_row.addWidget(self.archive_format_label)
             control_row.addWidget(self.format_combo)
             control_row.addWidget(self.encrypt_checkbox)
             control_row.addWidget(self.password_input)
             control_row.addStretch(1)
             control_row.addWidget(backup_button)
+            control_row.addWidget(self.stop_backup_button)
             action_layout.addLayout(control_row)
             self.smart_progress_bar = QProgressBar()
             self.smart_progress_bar.setRange(0, 100)
@@ -1331,17 +1424,17 @@ def run_app(auto_quit_ms: int | None = None) -> int:
         def open_preview_item(self, item: QListWidgetItem) -> None:
             path = item.data(PATH_ROLE)
             if path:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                open_local_path(Path(path), "Opening preview file with system default")
 
         def open_preview_table_item(self, item: QTableWidgetItem) -> None:
             path = item.data(PATH_ROLE)
             if path:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                open_local_path(Path(path), "Opening preview file with system default")
 
         def open_preview_tree_item(self, item: QTreeWidgetItem) -> None:
             path = item.data(0, PATH_ROLE)
             if path:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                open_local_path(Path(path), "Opening preview file with system default")
 
         def show_preview_context_menu(self, view, position) -> None:
             entry = view.itemAt(position)
@@ -1376,10 +1469,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                         stderr=subprocess.DEVNULL,
                     )
                 else:
-                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+                    open_local_path(directory, "Opening file explorer")
                 logger.info("Opened in file explorer: %s", path)
             except OSError:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+                open_local_path(directory, "Opening file explorer")
 
         def update_selection_label(self) -> None:
             total = len(self.items)
@@ -1394,7 +1487,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             )
 
         def create_backup(self) -> None:
-            if self.backup_thread and self.backup_thread.isRunning():
+            if (
+                (self.backup_thread and self.backup_thread.isRunning())
+                or (self.preflight_thread and self.preflight_thread.isRunning())
+            ):
                 return
             password = password_or_none(self.encrypt_checkbox, self.password_input)
             if password == "":
@@ -1445,25 +1541,134 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             for app_name in sorted(selected_app_names):
                 self.log_smart(f"Selected app inventory: {app_name}")
 
-            def task(progress):
-                return create_backup_package(
-                    output_path.parent,
+            def build_task(space_estimate):
+                def task(progress, cancel_event):
+                    return create_backup_package(
+                        output_path.parent,
+                        selected,
+                        archive_format,
+                        include_system_inventory=bool(selected_app_names),
+                        encryption_password=password,
+                        selected_application_names=selected_app_names,
+                        item_exclusions=item_exclusions,
+                        item_inclusions=item_inclusions,
+                        output_path=output_path,
+                        progress=progress,
+                        temporary_root=temporary_root,
+                        space_estimate=space_estimate,
+                        cancel_event=cancel_event,
+                    )
+
+                return task
+
+            self.start_smart_preflight_worker(
+                output_path,
+                temporary_root,
+                selected,
+                archive_format,
+                bool(password),
+                item_exclusions,
+                item_inclusions,
+                build_task,
+            )
+
+        def start_smart_preflight_worker(
+            self,
+            output_path: Path,
+            temporary_root: Path | None,
+            selected: list[BackupItem],
+            archive_format: ArchiveFormat,
+            encryption_enabled: bool,
+            item_exclusions: dict[str, set[str]],
+            item_inclusions: dict[str, set[str]],
+            build_task,
+        ) -> None:
+            self.backup_button.setEnabled(False)
+            self.stop_backup_button.setEnabled(True)
+            self.smart_progress_bar.setRange(0, 0)
+            self.log_smart(t("space_checking"))
+            self.preflight_build_task = build_task
+
+            def task(_progress, cancel_event):
+                estimate = estimate_backup_space(
                     selected,
                     archive_format,
-                    include_system_inventory=bool(selected_app_names),
-                    encryption_password=password,
-                    selected_application_names=selected_app_names,
-                    item_exclusions=item_exclusions,
-                    item_inclusions=item_inclusions,
-                    output_path=output_path,
-                    progress=progress,
-                    temporary_root=temporary_root,
+                    encryption_enabled,
+                    item_exclusions,
+                    item_inclusions,
+                    cancel_event,
                 )
+                return check_backup_space(output_path, temporary_root, estimate)
 
-            self.start_smart_backup_worker(task)
+            self.preflight_thread = QThread(self)
+            self.preflight_worker = BackupJobWorker(task)
+            self.preflight_worker.moveToThread(self.preflight_thread)
+            self.preflight_thread.started.connect(self.preflight_worker.run)
+            self.preflight_worker.finished.connect(self.on_smart_preflight_finished)
+            self.preflight_worker.failed.connect(self.on_smart_preflight_failed)
+            self.preflight_worker.cancelled.connect(self.on_smart_backup_cancelled)
+            self.preflight_worker.finished.connect(self.preflight_thread.quit)
+            self.preflight_worker.failed.connect(self.preflight_thread.quit)
+            self.preflight_worker.cancelled.connect(self.preflight_thread.quit)
+            self.preflight_worker.finished.connect(self.preflight_worker.deleteLater)
+            self.preflight_worker.failed.connect(self.preflight_worker.deleteLater)
+            self.preflight_worker.cancelled.connect(self.preflight_worker.deleteLater)
+            self.preflight_thread.finished.connect(self.preflight_thread.deleteLater)
+            self.preflight_thread.finished.connect(self.cleanup_smart_preflight_worker)
+            self.preflight_thread.start()
+
+        def cleanup_smart_preflight_worker(self) -> None:
+            self.preflight_thread = None
+            self.preflight_worker = None
+            if not self.backup_thread or not self.backup_thread.isRunning():
+                self.stop_backup_button.setEnabled(False)
+
+        def on_smart_preflight_finished(self, check: BackupSpaceCheck) -> None:
+            self.smart_progress_bar.setRange(0, 100)
+            self.smart_progress_bar.setValue(0)
+            body = t(
+                "backup_space_body",
+                source_size=format_bytes(check.estimate.source_bytes),
+                file_count=check.estimate.source_files,
+                output_required=format_bytes(check.destination_required_bytes),
+                output_free=format_bytes(check.destination_free_bytes),
+                temporary_required=format_bytes(check.temporary_required_bytes),
+                temporary_free=format_bytes(check.temporary_free_bytes),
+            )
+            if not check.is_sufficient:
+                self.log_smart(f"Backup space check failed: {body}")
+                MessageBox(t("insufficient_space"), body, self).exec()
+                self.preflight_build_task = None
+                self.backup_button.setEnabled(True)
+                return
+
+            self.log_smart(f"Backup space check passed: {body}")
+            dialog = MessageBox(t("backup_space_title"), body, self)
+            dialog.yesButton.setText(t("continue_backup"))
+            dialog.cancelButton.setText(t("cancel"))
+            if not dialog.exec():
+                self.preflight_build_task = None
+                self.backup_button.setEnabled(True)
+                return
+            build_task = self.preflight_build_task
+            self.preflight_build_task = None
+            if build_task:
+                self.start_smart_backup_worker(build_task(check.estimate))
+            else:
+                self.backup_button.setEnabled(True)
+
+        def on_smart_preflight_failed(self, message: str) -> None:
+            self.smart_progress_bar.setRange(0, 100)
+            self.smart_progress_bar.setValue(0)
+            self.log_smart(f"Backup space check failed: {message}")
+            MessageBox(t("backup_failed"), message, self).exec()
+            self.preflight_build_task = None
+            self.backup_button.setEnabled(True)
 
         def start_smart_backup_worker(self, task) -> None:
             self.backup_button.setEnabled(False)
+            self.stop_backup_button.setEnabled(True)
+            self.smart_progress_bar.setRange(0, 100)
             self.smart_progress_bar.setValue(0)
             self.backup_thread = QThread(self)
             self.backup_worker = BackupJobWorker(task)
@@ -1472,10 +1677,13 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.backup_worker.progress.connect(self.on_smart_backup_progress)
             self.backup_worker.finished.connect(self.on_smart_backup_finished)
             self.backup_worker.failed.connect(self.on_smart_backup_failed)
+            self.backup_worker.cancelled.connect(self.on_smart_backup_cancelled)
             self.backup_worker.finished.connect(self.backup_thread.quit)
             self.backup_worker.failed.connect(self.backup_thread.quit)
+            self.backup_worker.cancelled.connect(self.backup_thread.quit)
             self.backup_worker.finished.connect(self.backup_worker.deleteLater)
             self.backup_worker.failed.connect(self.backup_worker.deleteLater)
+            self.backup_worker.cancelled.connect(self.backup_worker.deleteLater)
             self.backup_thread.finished.connect(self.backup_thread.deleteLater)
             self.backup_thread.finished.connect(self.cleanup_smart_backup_worker)
             self.backup_thread.start()
@@ -1484,24 +1692,49 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.backup_thread = None
             self.backup_worker = None
             self.backup_button.setEnabled(True)
+            self.stop_backup_button.setEnabled(False)
 
         def log_smart(self, message: str) -> None:
             logger.info(message)
             self.smart_log_text.append(message)
 
         def on_smart_backup_progress(self, message: str, current: int, total: int) -> None:
-            if total > 0 and current >= 0:
+            if total <= 0 or current < 0:
+                self.smart_progress_bar.setRange(0, 0)
+            elif total > 0:
+                if (
+                    self.smart_progress_bar.minimum() != 0
+                    or self.smart_progress_bar.maximum() != 100
+                ):
+                    self.smart_progress_bar.setRange(0, 100)
                 self.smart_progress_bar.setValue(max(0, min(100, int(current / total * 100))))
             self.log_smart(message)
 
         def on_smart_backup_finished(self, package: object) -> None:
             self.smart_progress_bar.setValue(100)
             self.log_smart(f"Backup created: {package}")
-            MessageBox(t("backup_created"), str(package), self).exec()
+            show_backup_created(self, package)
 
         def on_smart_backup_failed(self, message: str) -> None:
             self.log_smart(f"Backup failed: {message}")
             MessageBox(t("backup_failed"), message, self).exec()
+
+        def on_smart_backup_cancelled(self, message: str) -> None:
+            self.smart_progress_bar.setRange(0, 100)
+            self.smart_progress_bar.setValue(0)
+            self.log_smart(message)
+            if not self.backup_thread or not self.backup_thread.isRunning():
+                self.preflight_build_task = None
+                self.backup_button.setEnabled(True)
+            MessageBox(t("backup_cancelled"), t("backup_cancelled_body"), self).exec()
+
+        def request_stop_smart_backup(self) -> None:
+            worker = self.backup_worker or self.preflight_worker
+            if not worker or not confirm_stop_operation(self):
+                return
+            worker.cancel()
+            self.stop_backup_button.setEnabled(False)
+            self.log_smart(t("stop_operation"))
 
         def retranslate(self) -> None:
             super().retranslate()
@@ -1516,6 +1749,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.encrypt_checkbox.setText(t("encrypt_output"))
                 self.password_input.setPlaceholderText(t("password"))
                 self.backup_button.setText(t("create_smart_backup"))
+                self.stop_backup_button.setText(t("stop"))
                 self.file_view_label.setText(t("file_view"))
                 self.file_view_combo.setItemText(0, t("view_tree"))
                 self.file_view_combo.setItemText(1, t("view_list"))
@@ -1532,7 +1766,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.update_selection_label()
 
         def shutdown_workers(self) -> None:
-            for thread in (self.preview_thread, self.apps_thread):
+            for thread in (self.preview_thread, self.apps_thread, self.preflight_thread):
                 if thread and thread.isRunning():
                     thread.quit()
                     thread.wait(1500)
@@ -1643,13 +1877,21 @@ def run_app(auto_quit_ms: int | None = None) -> int:
 
             _, progress_layout = self.add_card()
             self.full_progress_title = SubtitleLabel()
+            self.full_stop_button = PushButton(icon("CANCEL"), "")
+            self.full_stop_button.setMaximumWidth(120)
+            self.full_stop_button.setEnabled(False)
+            self.full_stop_button.clicked.connect(self.request_stop_full_backup)
+            full_progress_header = QHBoxLayout()
+            full_progress_header.addWidget(self.full_progress_title)
+            full_progress_header.addStretch(1)
+            full_progress_header.addWidget(self.full_stop_button)
             self.full_progress_bar = QProgressBar()
             self.full_progress_bar.setRange(0, 100)
             self.full_progress_bar.setValue(0)
             self.full_log_text = TextEdit()
             self.full_log_text.setReadOnly(True)
             self.full_log_text.setMaximumHeight(150)
-            progress_layout.addWidget(self.full_progress_title)
+            progress_layout.addLayout(full_progress_header)
             progress_layout.addWidget(self.full_progress_bar)
             progress_layout.addWidget(self.full_log_text)
             self.root_layout.addStretch(1)
@@ -1684,7 +1926,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.log_full(f"Selected volume: {volume}")
             self.log_full(f"Output package: {output_path}")
 
-            def task(progress):
+            def task(progress, cancel_event):
                 return create_volume_iso_backup(
                     volume,
                     output_path.parent,
@@ -1692,6 +1934,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     output_path=output_path,
                     progress=progress,
                     temporary_root=temporary_root,
+                    cancel_event=cancel_event,
                 )
 
             self.start_full_backup_worker(task)
@@ -1734,7 +1977,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.log_full(f"Selected folder: {folder_path}")
             self.log_full(f"Output package: {output_path}")
 
-            def task(progress):
+            def task(progress, cancel_event):
                 return create_folder_backup(
                     FullBackupTarget(path=folder_path, label=str(folder_path)),
                     output_path.parent,
@@ -1743,6 +1986,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     output_path=output_path,
                     progress=progress,
                     temporary_root=temporary_root,
+                    cancel_event=cancel_event,
                 )
 
             self.start_full_backup_worker(task)
@@ -1750,6 +1994,8 @@ def run_app(auto_quit_ms: int | None = None) -> int:
         def start_full_backup_worker(self, task) -> None:
             self.volume_button.setEnabled(False)
             self.folder_create_button.setEnabled(False)
+            self.full_stop_button.setEnabled(True)
+            self.full_progress_bar.setRange(0, 100)
             self.full_progress_bar.setValue(0)
             self.full_backup_thread = QThread(self)
             self.full_backup_worker = BackupJobWorker(task)
@@ -1758,10 +2004,13 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.full_backup_worker.progress.connect(self.on_full_backup_progress)
             self.full_backup_worker.finished.connect(self.on_full_backup_finished)
             self.full_backup_worker.failed.connect(self.on_full_backup_failed)
+            self.full_backup_worker.cancelled.connect(self.on_full_backup_cancelled)
             self.full_backup_worker.finished.connect(self.full_backup_thread.quit)
             self.full_backup_worker.failed.connect(self.full_backup_thread.quit)
+            self.full_backup_worker.cancelled.connect(self.full_backup_thread.quit)
             self.full_backup_worker.finished.connect(self.full_backup_worker.deleteLater)
             self.full_backup_worker.failed.connect(self.full_backup_worker.deleteLater)
+            self.full_backup_worker.cancelled.connect(self.full_backup_worker.deleteLater)
             self.full_backup_thread.finished.connect(self.full_backup_thread.deleteLater)
             self.full_backup_thread.finished.connect(self.cleanup_full_backup_worker)
             self.full_backup_thread.start()
@@ -1771,24 +2020,42 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.full_backup_worker = None
             self.volume_button.setEnabled(True)
             self.folder_create_button.setEnabled(True)
+            self.full_stop_button.setEnabled(False)
 
         def log_full(self, message: str) -> None:
             logger.info(message)
             self.full_log_text.append(message)
 
         def on_full_backup_progress(self, message: str, current: int, total: int) -> None:
-            if total > 0 and current >= 0:
+            if total <= 0 or current < 0:
+                self.full_progress_bar.setRange(0, 0)
+            elif total > 0:
+                if self.full_progress_bar.minimum() != 0 or self.full_progress_bar.maximum() != 100:
+                    self.full_progress_bar.setRange(0, 100)
                 self.full_progress_bar.setValue(max(0, min(100, int(current / total * 100))))
             self.log_full(message)
 
         def on_full_backup_finished(self, package: object) -> None:
             self.full_progress_bar.setValue(100)
             self.log_full(f"Backup created: {package}")
-            MessageBox(t("backup_created"), str(package), self).exec()
+            show_backup_created(self, package)
 
         def on_full_backup_failed(self, message: str) -> None:
             self.log_full(f"Backup failed: {message}")
             MessageBox(t("backup_failed"), message, self).exec()
+
+        def on_full_backup_cancelled(self, message: str) -> None:
+            self.full_progress_bar.setRange(0, 100)
+            self.full_progress_bar.setValue(0)
+            self.log_full(message)
+            MessageBox(t("backup_cancelled"), t("backup_cancelled_body"), self).exec()
+
+        def request_stop_full_backup(self) -> None:
+            if not self.full_backup_worker or not confirm_stop_operation(self):
+                return
+            self.full_backup_worker.cancel()
+            self.full_stop_button.setEnabled(False)
+            self.log_full(t("stop_operation"))
 
         def shutdown_workers(self) -> None:
             if self.full_backup_thread and self.full_backup_thread.isRunning():
@@ -1818,12 +2085,16 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.folder_password_input.setPlaceholderText(t("password"))
                 self.folder_create_button.setText(t("create_folder_backup"))
                 self.full_progress_title.setText(t("backup_progress"))
+                self.full_stop_button.setText(t("stop"))
 
     class PackageBrowserPage(Page):
         def __init__(self) -> None:
             super().__init__("browser_title", "browser_subtitle")
             self.current_package_path: Path | None = None
-            self.entry_by_row: dict[int, str] = {}
+            self.current_entries = []
+            self.entry_groups: dict[str, list] = {"data": [], "inventory": [], "recovery": []}
+            self.data_entries_by_item: dict[str, list] = {}
+            self.data_item_by_row: dict[int, str] = {}
             _, picker_layout = self.add_card()
             picker_row = QHBoxLayout()
             picker_row.setSpacing(12)
@@ -1840,62 +2111,156 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.extract_entry_button.setMaximumWidth(190)
             self.extract_entry_button.setEnabled(False)
             self.extract_entry_button.clicked.connect(self.extract_selected_entry)
+            self.extract_package_button = PushButton(icon("FOLDER", "SAVE"), "")
+            self.extract_package_button.setMaximumWidth(190)
+            self.extract_package_button.setEnabled(False)
+            self.extract_package_button.clicked.connect(self.extract_package)
             picker_row.addWidget(self.package_input, 1)
             picker_row.addWidget(self.open_file_button)
             picker_row.addWidget(self.open_dir_button)
             picker_row.addWidget(self.extract_entry_button)
+            picker_row.addWidget(self.extract_package_button)
             picker_layout.addLayout(picker_row)
 
-            _, browser_layout = self.add_card()
-            split_row = QHBoxLayout()
-            split_row.setSpacing(18)
-            left_col = QVBoxLayout()
-            right_col = QVBoxLayout()
+            _, overview_layout = self.add_card()
             self.manifest_label = SubtitleLabel()
+            overview_layout.addWidget(self.manifest_label)
+            overview_grid = QGridLayout()
+            overview_grid.setHorizontalSpacing(28)
+            overview_grid.setVerticalSpacing(12)
+            self.overview_fields: dict[str, CaptionLabel] = {}
+            for index, key in enumerate(
+                ["created_at", "mode", "format", "item_count", "file_count", "package_size"]
+            ):
+                label = BodyLabel()
+                value = CaptionLabel("-")
+                value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                overview_grid.addWidget(label, index // 3 * 2, index % 3)
+                overview_grid.addWidget(value, index // 3 * 2 + 1, index % 3)
+                self.overview_fields[key] = value
+                setattr(self, f"overview_{key}_label", label)
+            overview_layout.addLayout(overview_grid)
+
+            _, workspace_layout = self.add_card()
+            workspace_header = QHBoxLayout()
+            self.browser_section_label = SubtitleLabel()
+            self.browser_section_combo = ComboBox()
+            self.browser_section_combo.addItems(["data", "applications", "conda", "recovery"])
+            self.browser_section_combo.currentIndexChanged.connect(self.change_browser_section)
+            workspace_header.addWidget(self.browser_section_label)
+            workspace_header.addStretch(1)
+            workspace_header.addWidget(self.browser_section_combo)
+            workspace_layout.addLayout(workspace_header)
+
+            self.browser_stack = QStackedWidget()
+            self.data_workspace = QWidget()
+            data_items_layout = QVBoxLayout(self.data_workspace)
+            data_items_layout.setContentsMargins(0, 0, 0, 0)
+            data_items_header = QHBoxLayout()
+            self.data_items_label = SubtitleLabel()
+            self.data_items_summary = CaptionLabel()
+            data_items_header.addWidget(self.data_items_label)
+            data_items_header.addStretch(1)
+            data_items_header.addWidget(self.data_items_summary)
+            data_items_layout.addLayout(data_items_header)
+            self.data_items_table = TableWidget()
+            self.data_items_table.setColumnCount(5)
+            self.data_items_table.setWordWrap(False)
+            self.data_items_table.setAlternatingRowColors(True)
+            self.data_items_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.data_items_table.verticalHeader().setVisible(False)
+            self.data_items_table.setMinimumHeight(260)
+            self.data_items_table.cellClicked.connect(self.open_data_item_in_browser)
+            make_table_columns_resizable(self.data_items_table)
+            self.data_items_table.setColumnWidth(0, 240)
+            self.data_items_table.setColumnWidth(1, 160)
+            self.data_items_table.setColumnWidth(2, 280)
+            data_items_layout.addWidget(self.data_items_table)
+            self.trap_child_wheel(self.data_items_table)
+
+            self.application_workspace = QWidget()
+            application_layout = QVBoxLayout(self.application_workspace)
+            application_layout.setContentsMargins(0, 0, 0, 0)
+            app_header = QHBoxLayout()
+            self.applications_label = SubtitleLabel()
+            self.applications_summary = CaptionLabel()
+            app_header.addWidget(self.applications_label)
+            app_header.addStretch(1)
+            app_header.addWidget(self.applications_summary)
+            application_layout.addLayout(app_header)
+            self.application_table = TableWidget()
+            self.application_table.setColumnCount(4)
+            self.application_table.setWordWrap(False)
+            self.application_table.setAlternatingRowColors(True)
+            self.application_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.application_table.verticalHeader().setVisible(False)
+            self.application_table.setMinimumHeight(260)
+            make_table_columns_resizable(self.application_table)
+            self.application_table.setColumnWidth(0, 260)
+            self.application_table.setColumnWidth(1, 130)
+            self.application_table.setColumnWidth(2, 220)
+            application_layout.addWidget(self.application_table)
+            self.trap_child_wheel(self.application_table)
+
+            self.environment_workspace = QWidget()
+            environment_layout = QVBoxLayout(self.environment_workspace)
+            environment_layout.setContentsMargins(0, 0, 0, 0)
+            environment_header = QHBoxLayout()
+            self.environment_label = SubtitleLabel()
+            self.environment_summary = CaptionLabel()
+            environment_header.addWidget(self.environment_label)
+            environment_header.addStretch(1)
+            environment_header.addWidget(self.environment_summary)
+            environment_layout.addLayout(environment_header)
+            self.conda_table = TableWidget()
+            self.conda_table.setColumnCount(4)
+            self.conda_table.setWordWrap(False)
+            self.conda_table.setAlternatingRowColors(True)
+            self.conda_table.verticalHeader().setVisible(False)
+            self.conda_table.setMinimumHeight(260)
+            make_table_columns_resizable(self.conda_table)
+            self.conda_table.setColumnWidth(0, 200)
+            self.conda_table.setColumnWidth(1, 320)
+            self.conda_table.setColumnWidth(2, 140)
+            environment_layout.addWidget(self.conda_table)
+            self.trap_child_wheel(self.conda_table)
+
+            self.recovery_workspace = QWidget()
+            recovery_layout = QVBoxLayout(self.recovery_workspace)
+            recovery_layout.setContentsMargins(0, 0, 0, 0)
+            self.recovery_label = SubtitleLabel()
+            self.recovery_text = TextEdit()
+            self.recovery_text.setReadOnly(True)
+            self.recovery_text.setMinimumHeight(260)
+            recovery_layout.addWidget(self.recovery_label)
+            recovery_layout.addWidget(self.recovery_text)
+
+            for page in (
+                self.data_workspace,
+                self.application_workspace,
+                self.environment_workspace,
+                self.recovery_workspace,
+            ):
+                self.browser_stack.addWidget(page)
+            workspace_layout.addWidget(self.browser_stack)
+
             self.files_label = SubtitleLabel()
-            self.preview_label = SubtitleLabel()
-            self.entry_filter_input = LineEdit()
-            self.entry_filter_input.setClearButtonEnabled(True)
-            self.entry_filter_input.textChanged.connect(self.filter_entries)
-            self.manifest_text = TextEdit()
-            self.manifest_text.setReadOnly(True)
-            self.manifest_text.setMinimumHeight(96)
-            self.manifest_text.setMaximumHeight(130)
-            self.entry_table = TableWidget()
-            self.entry_table.setColumnCount(3)
-            self.entry_table.setWordWrap(False)
-            self.entry_table.verticalHeader().setVisible(False)
-            self.entry_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            self.entry_table.setMinimumHeight(380)
-            self.entry_table.currentCellChanged.connect(self.preview_selected_entry)
-            make_table_columns_resizable(self.entry_table)
-            self.entry_table.setColumnWidth(0, 260)
-            self.entry_table.setColumnWidth(1, 110)
-            self.entry_table.setColumnWidth(2, 300)
-            self.preview_text = TextEdit()
-            self.preview_text.setReadOnly(True)
-            self.preview_text.setMinimumHeight(520)
-            self.preview_image = QLabel()
-            self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.preview_image.setMinimumHeight(520)
-            self.preview_image.setWordWrap(True)
-            self.preview_stack = QStackedWidget()
-            self.preview_stack.addWidget(self.preview_text)
-            self.preview_stack.addWidget(self.preview_image)
-            left_col.addWidget(self.manifest_label)
-            left_col.addWidget(self.manifest_text)
-            files_header = QHBoxLayout()
-            files_header.addWidget(self.files_label)
-            files_header.addStretch(1)
-            files_header.addWidget(self.entry_filter_input)
-            left_col.addLayout(files_header)
-            left_col.addWidget(self.entry_table, 1)
-            right_col.addWidget(self.preview_label)
-            right_col.addWidget(self.preview_stack, 1)
-            split_row.addLayout(left_col, 2)
-            split_row.addLayout(right_col, 3)
-            browser_layout.addLayout(split_row)
-            self.trap_child_wheel(self.entry_table)
+            workspace_layout.addWidget(self.files_label)
+            file_workspace = QHBoxLayout()
+            file_workspace.setSpacing(18)
+            self.archive_preview = ArchiveFilePreviewPanel(t, format_bytes, self)
+            self.archive_preview.set_export_enabled(True)
+            self.archive_preview.entryExportRequested.connect(self.extract_entry_path)
+            self.archive_preview.entryOpenRequested.connect(self.open_entry_with_system_default)
+            self.archive_preview.packageLocationRequested.connect(self.open_package_location)
+            self.trap_child_wheel(
+                self.archive_preview.tree,
+                self.archive_preview.list_view,
+                self.archive_preview.table,
+                self.archive_preview.icon_view,
+            )
+            file_workspace.addWidget(self.archive_preview)
+            workspace_layout.addLayout(file_workspace)
             self.retranslate()
 
         def open_package_file(self) -> None:
@@ -1906,62 +2271,229 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 "Backup packages (*.zip *.7z *.iso);;All files (*.*)",
             )
             if file_name:
-                self.load_package(Path(file_name))
+                self.open_selected_package(Path(file_name))
 
         def open_package_directory(self) -> None:
             directory = QFileDialog.getExistingDirectory(self, t("open_backup_dir"))
             if directory:
-                self.load_package(Path(directory))
+                self.open_selected_package(Path(directory))
+
+        def open_selected_package(self, package_path: Path) -> None:
+            logger.info("Opening backup package: %s", package_path)
+            try:
+                self.load_package(package_path)
+            except Exception as exc:
+                logger.exception("Failed to load backup package: %s", package_path)
+                MessageBox(t("cannot_open_package"), str(exc), self).exec()
 
         def load_package(self, package_path: Path) -> None:
             try:
                 manifest = read_manifest(package_path, configured_temporary_root())
                 entries = list_entries(package_path)
             except Exception as exc:
+                logger.exception("Unable to inspect backup package: %s", package_path)
                 MessageBox(t("cannot_open_package"), str(exc), self).exec()
                 return
             self.current_package_path = package_path
+            self.current_entries = entries
             self.package_input.setText(str(package_path))
             self.extract_entry_button.setEnabled(bool(entries))
-            self.entry_by_row.clear()
-            self.entry_table.clearContents()
-            self.entry_table.setRowCount(len(entries))
-            for row, entry in enumerate(entries):
-                entry_path = Path(entry.path)
+            self.extract_package_button.setEnabled(bool(entries))
+            self.entry_groups = {
+                "data": [
+                    entry for entry in entries if entry.path.replace("\\", "/").startswith("data/")
+                ],
+                "inventory": [
+                    entry
+                    for entry in entries
+                    if entry.path.replace("\\", "/").startswith("inventory/")
+                ],
+                "recovery": [
+                    entry
+                    for entry in entries
+                    if not entry.path.replace("\\", "/").startswith(("data/", "inventory/"))
+                ],
+            }
+            entries_by_path = {
+                entry.path.replace("\\", "/").strip("/"): entry
+                for entry in self.entry_groups["data"]
+            }
+            self.data_entries_by_item = {}
+            for file_entry in manifest.get("files", []):
+                item_id = str(file_entry.get("source_item_id") or "")
+                relative_path = (
+                    str(file_entry.get("relative_path") or "").replace("\\", "/").strip("/")
+                )
+                entry = entries_by_path.get(relative_path)
+                if item_id and entry:
+                    self.data_entries_by_item.setdefault(item_id, []).append(entry)
+            self.overview_fields["created_at"].setText(str(manifest.get("created_at") or "-"))
+            self.overview_fields["mode"].setText(str(manifest.get("mode") or "-"))
+            self.overview_fields["format"].setText(str(manifest.get("archive_format") or "-"))
+            self.overview_fields["item_count"].setText(str(len(manifest.get("items", []))))
+            self.overview_fields["file_count"].setText(str(len(manifest.get("files", []))))
+            total_size = sum(entry.size for entry in entries)
+            self.overview_fields["package_size"].setText(format_bytes(total_size))
+            self.populate_application_table(manifest.get("installed_applications", []))
+            self.populate_data_item_table(manifest)
+            self.populate_conda_table()
+            self.populate_recovery_information(manifest)
+            self.browser_section_combo.blockSignals(True)
+            self.browser_section_combo.setCurrentIndex(0)
+            self.browser_section_combo.blockSignals(False)
+            self.change_browser_section(0)
+
+        def populate_application_table(self, applications: list[dict]) -> None:
+            self.application_table.clearContents()
+            visible_apps = applications[:300]
+            self.application_table.setRowCount(len(visible_apps))
+            for row, application in enumerate(visible_apps):
                 values = [
-                    entry_path.name or entry.path,
-                    str(entry.size),
-                    entry_path.parent.as_posix() if entry_path.parent.as_posix() != "." else ".",
+                    str(application.get("name") or "-"),
+                    str(application.get("version") or "-"),
+                    str(application.get("publisher") or "-"),
+                    str(application.get("install_location") or "-"),
                 ]
-                self.entry_by_row[row] = entry.path
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setToolTip(value)
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    self.application_table.setItem(row, column, item)
+            self.applications_summary.setText(
+                t("applications_found", shown=len(visible_apps), total=len(applications))
+            )
+
+        def populate_data_item_table(self, manifest: dict) -> None:
+            files_by_item: dict[str, tuple[int, int]] = {}
+            for file_entry in manifest.get("files", []):
+                item_id = str(file_entry.get("source_item_id") or "")
+                count, total_size = files_by_item.get(item_id, (0, 0))
+                files_by_item[item_id] = (count + 1, total_size + int(file_entry.get("size") or 0))
+
+            items = manifest.get("items", [])
+            self.data_item_by_row.clear()
+            self.data_items_table.clearContents()
+            self.data_items_table.setRowCount(len(items))
+            for row, item in enumerate(items):
+                item_id = str(item.get("id") or "")
+                file_count, total_size = files_by_item.get(item_id, (0, 0))
+                values = [
+                    str(item.get("name") or item_id or "-"),
+                    str(item.get("software") or item.get("category") or "-"),
+                    str(item.get("path") or "-"),
+                    str(file_count),
+                    format_bytes(total_size),
+                ]
+                self.data_item_by_row[row] = item_id
                 for column, value in enumerate(values):
                     table_item = QTableWidgetItem(value)
-                    table_item.setData(PATH_ROLE, entry.path)
-                    table_item.setToolTip(entry.path)
+                    table_item.setData(ITEM_ID_ROLE, item_id)
+                    table_item.setToolTip(value)
                     table_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                    self.entry_table.setItem(row, column, table_item)
-            self.manifest_text.setPlainText(
-                f"{t('created_at')}: {manifest.get('created_at')}\n"
-                f"{t('mode')}: {manifest.get('mode')}\n"
-                f"{t('format')}: {manifest.get('archive_format')}\n"
-                f"{t('item_count')}: {len(manifest.get('items', []))}\n"
-                f"{t('file_count')}: {len(manifest.get('files', []))}"
-            )
-            if entries:
-                self.entry_table.setCurrentCell(0, 0)
-            self.filter_entries()
+                    self.data_items_table.setItem(row, column, table_item)
+            self.data_items_summary.setText(t("migrated_data_summary", count=len(items)))
 
-        def filter_entries(self) -> None:
-            query = self.entry_filter_input.text().strip().casefold()
-            for row, entry_path in self.entry_by_row.items():
-                hidden = bool(query and query not in entry_path.casefold())
-                self.entry_table.setRowHidden(row, hidden)
+        def open_data_item_in_browser(self, row: int, *_: object) -> None:
+            item_id = self.data_item_by_row.get(row)
+            if not item_id:
+                return
+            self.browser_section_combo.setCurrentIndex(0)
+            self.archive_preview.filter_input.blockSignals(True)
+            self.archive_preview.filter_input.clear()
+            self.archive_preview.filter_input.blockSignals(False)
+            self.archive_preview.set_entries(self.data_entries_by_item.get(item_id, []))
+
+        def populate_conda_table(self) -> None:
+            self.conda_table.clearContents()
+            plans = []
+            export_results: dict[str, dict] = {}
+            if self.current_package_path:
+                try:
+                    raw = read_entry_bytes(
+                        self.current_package_path,
+                        "inventory/conda_export_plans.json",
+                        limit=2 * 1024 * 1024,
+                        temporary_root=configured_temporary_root(),
+                    )
+                    plans = json.loads(raw.decode("utf-8"))
+                except (KeyError, OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
+                    plans = []
+                    logger.info(
+                        "No Conda export plan found in package: %s", self.current_package_path
+                    )
+                try:
+                    raw = read_entry_bytes(
+                        self.current_package_path,
+                        "inventory/conda_export_results.json",
+                        limit=2 * 1024 * 1024,
+                        temporary_root=configured_temporary_root(),
+                    )
+                    export_results = {
+                        str(result.get("environment", {}).get("name") or ""): result
+                        for result in json.loads(raw.decode("utf-8"))
+                    }
+                except (KeyError, OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
+                    export_results = {}
+                    logger.info(
+                        "No Conda export results found in package: %s", self.current_package_path
+                    )
+            self.conda_table.setRowCount(min(len(plans), 200))
+            for row, plan in enumerate(plans[:200]):
+                environment = plan.get("environment", {})
+                result = export_results.get(str(environment.get("name") or ""), {})
+                exported_files = result.get("exported_files") or []
+                values = [
+                    str(environment.get("name") or "-"),
+                    str(environment.get("prefix") or "-"),
+                    str(len(exported_files)),
+                    " ".join(plan.get("restore_command") or []),
+                ]
+                for column, value in enumerate(values):
+                    table_item = QTableWidgetItem(value)
+                    table_item.setToolTip(value)
+                    table_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    self.conda_table.setItem(row, column, table_item)
+            self.environment_summary.setText(t("conda_environments_found", count=len(plans)))
+
+        def populate_recovery_information(self, manifest: dict) -> None:
+            metadata = manifest.get("metadata", {})
+            registry_entries = [
+                entry
+                for entry in self.entry_groups["recovery"]
+                if entry.path.startswith("registry/")
+            ]
+            restore_notes = any(
+                entry.path.upper() == "RESTORE.MD" for entry in self.entry_groups["recovery"]
+            )
+            sensitive = metadata.get("sensitive_items", [])
+            self.recovery_text.setPlainText(
+                "\n".join(
+                    [
+                        f"{t('registry_exports')}: {len(registry_entries)}",
+                        f"{t('restore_notes')}: {t('available') if restore_notes else t('none')}",
+                        f"{t('sensitive_items')}: "
+                        f"{', '.join(sensitive) if sensitive else t('none')}",
+                        f"{t('package_metadata')}: {len(self.entry_groups['recovery'])}",
+                    ]
+                )
+            )
+
+        def change_browser_section(self, index: int) -> None:
+            index = max(0, min(index, 3))
+            self.browser_stack.setCurrentIndex(index)
+            scope = ("data", "inventory", "inventory", "recovery")[index]
+            self.archive_preview.filter_input.blockSignals(True)
+            self.archive_preview.filter_input.clear()
+            self.archive_preview.filter_input.blockSignals(False)
+            self.archive_preview.set_entries(self.entry_groups.get(scope, []))
 
         def extract_selected_entry(self) -> None:
+            entry_path = self.archive_preview.current_entry_path()
+            if entry_path:
+                self.extract_entry_path(entry_path)
+
+        def extract_entry_path(self, entry_path: str) -> None:
             if not self.current_package_path:
-                return
-            entry_path = self.entry_by_row.get(self.entry_table.currentRow())
-            if not entry_path:
                 return
             destination_dir = QFileDialog.getExistingDirectory(self, t("extract_selected_entry"))
             if not destination_dir:
@@ -1975,48 +2507,57 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                     configured_temporary_root(),
                 )
             except Exception as exc:
+                logger.exception("Failed to extract package entry: %s", entry_path)
                 MessageBox(t("cannot_open_package"), str(exc), self).exec()
+                return
+            logger.info("Extracted package entry | entry=%s | destination=%s", entry_path, target)
 
-        def preview_selected_entry(self, row: int = -1, *_: object) -> None:
+        def extract_package(self) -> None:
             if not self.current_package_path:
                 return
-            if row < 0:
-                row = self.entry_table.currentRow()
-            entry_path = self.entry_by_row.get(row)
-            if not entry_path:
+            destination_dir = QFileDialog.getExistingDirectory(self, t("extract_backup_package"))
+            if not destination_dir:
                 return
             try:
-                if Path(entry_path).suffix.lower() in IMAGE_EXTENSIONS:
-                    image = QPixmap()
-                    raw = read_entry_bytes(
-                        self.current_package_path,
-                        entry_path,
-                        limit=16 * 1024 * 1024,
-                        temporary_root=configured_temporary_root(),
-                    )
-                    if image.loadFromData(raw):
-                        self.preview_image.setPixmap(
-                            image.scaled(
-                                self.preview_stack.size(),
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation,
-                            )
-                        )
-                        self.preview_stack.setCurrentWidget(self.preview_image)
-                        return
-                    self.preview_image.setText(t("image_preview_failed"))
-                    self.preview_stack.setCurrentWidget(self.preview_image)
-                    return
-                text = preview_entry_text(
+                extract_package_to(
                     self.current_package_path,
-                    entry_path,
+                    Path(destination_dir),
                     configured_temporary_root(),
                 )
-                self.preview_text.setPlainText(text)
-                self.preview_stack.setCurrentWidget(self.preview_text)
             except Exception as exc:
-                self.preview_text.setPlainText(str(exc))
-                self.preview_stack.setCurrentWidget(self.preview_text)
+                logger.exception("Failed to extract backup package: %s", self.current_package_path)
+                MessageBox(t("cannot_open_package"), str(exc), self).exec()
+                return
+            logger.info(
+                "Extracted backup package | package=%s | destination=%s",
+                self.current_package_path,
+                destination_dir,
+            )
+
+        def open_package_location(self) -> None:
+            if not self.current_package_path:
+                return
+            location = self.current_package_path.parent
+            open_local_path(location, "Opening backup package location")
+
+        def open_entry_with_system_default(self, entry_path: str) -> None:
+            if not self.current_package_path:
+                return
+            try:
+                temporary_root = prepare_temporary_root(configured_temporary_root())
+                open_root = Path(
+                    tempfile.mkdtemp(prefix="back-up-helper-open-", dir=temporary_root)
+                )
+                extracted = copy_entry_to(
+                    self.current_package_path,
+                    entry_path,
+                    open_root / Path(entry_path),
+                    configured_temporary_root(),
+                )
+                open_local_path(extracted, "Opening extracted package entry with system default")
+            except Exception as exc:
+                logger.exception("Failed to open package entry: %s", entry_path)
+                MessageBox(t("cannot_open_package"), str(exc), self).exec()
 
         def retranslate(self) -> None:
             super().retranslate()
@@ -2024,11 +2565,48 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.open_file_button.setText(t("open_backup_file"))
                 self.open_dir_button.setText(t("open_backup_dir"))
                 self.extract_entry_button.setText(t("extract_selected_entry"))
-                self.entry_filter_input.setPlaceholderText(t("filter_files"))
-                self.manifest_label.setText(t("manifest_summary"))
-                self.files_label.setText(t("files"))
-                self.preview_label.setText(t("preview"))
-                self.entry_table.setHorizontalHeaderLabels([t("name"), "Size", t("path")])
+                self.extract_package_button.setText(t("extract_backup_package"))
+                self.manifest_label.setText(t("package_overview"))
+                self.overview_created_at_label.setText(t("created_at"))
+                self.overview_mode_label.setText(t("mode"))
+                self.overview_format_label.setText(t("format"))
+                self.overview_item_count_label.setText(t("item_count"))
+                self.overview_file_count_label.setText(t("file_count"))
+                self.overview_package_size_label.setText(t("package_size"))
+                self.applications_label.setText(t("package_applications"))
+                self.application_table.setHorizontalHeaderLabels(
+                    [t("name"), t("version"), t("publisher"), t("path")]
+                )
+                self.data_items_label.setText(t("migrated_data"))
+                self.data_items_table.setHorizontalHeaderLabels(
+                    [t("name"), t("software"), t("source_path"), t("file_count"), t("size")]
+                )
+                self.environment_label.setText(t("conda_environments"))
+                self.conda_table.setHorizontalHeaderLabels(
+                    [
+                        t("environment"),
+                        t("environment_path"),
+                        t("exported_files"),
+                        t("restore_command"),
+                    ]
+                )
+                self.browser_section_label.setText(t("browser_section"))
+                current_index = self.browser_section_combo.currentIndex()
+                self.browser_section_combo.blockSignals(True)
+                self.browser_section_combo.clear()
+                self.browser_section_combo.addItems(
+                    [
+                        t("package_data"),
+                        t("package_applications"),
+                        t("conda_environments"),
+                        t("package_registry_restore"),
+                    ]
+                )
+                self.browser_section_combo.setCurrentIndex(max(0, current_index))
+                self.browser_section_combo.blockSignals(False)
+                self.files_label.setText(t("package_contents"))
+                self.archive_preview.retranslate()
+                self.recovery_label.setText(t("package_registry_restore"))
 
     class RestorePage(Page):
         def __init__(self) -> None:
@@ -2081,6 +2659,35 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             grid.addWidget(self.restore_button, 4, 2, alignment=Qt.AlignmentFlag.AlignRight)
             form_layout.addLayout(grid)
 
+            _, package_preview_layout = self.add_card()
+            restore_preview_header = QHBoxLayout()
+            self.restore_package_contents_label = SubtitleLabel()
+            self.restore_package_summary = CaptionLabel()
+            self.restore_package_summary.setWordWrap(True)
+            restore_preview_header.addWidget(self.restore_package_contents_label)
+            restore_preview_header.addStretch(1)
+            restore_preview_header.addWidget(self.restore_package_summary)
+            package_preview_layout.addLayout(restore_preview_header)
+            restore_preview_row = QHBoxLayout()
+            restore_preview_row.setSpacing(18)
+            self.restore_archive_preview = ArchiveFilePreviewPanel(t, format_bytes, self)
+            self.restore_archive_preview.set_export_enabled(False)
+            self.restore_archive_preview.entrySelected.connect(self.preview_restore_package_entry)
+            self.restore_archive_preview.entryActivated.connect(self.preview_restore_package_entry)
+            self.restore_entry_preview = TextEdit()
+            self.restore_entry_preview.setReadOnly(True)
+            self.restore_entry_preview.setMinimumHeight(390)
+            self.restore_entry_preview.setPlainText(t("select_file_to_preview"))
+            restore_preview_row.addWidget(self.restore_archive_preview, 3)
+            restore_preview_row.addWidget(self.restore_entry_preview, 2)
+            package_preview_layout.addLayout(restore_preview_row)
+            self.trap_child_wheel(
+                self.restore_archive_preview.tree,
+                self.restore_archive_preview.list_view,
+                self.restore_archive_preview.table,
+                self.restore_archive_preview.icon_view,
+            )
+
             _, plan_layout = self.add_card()
             self.restore_plan_label = SubtitleLabel()
             self.restore_plan_summary = CaptionLabel()
@@ -2101,13 +2708,21 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.trap_child_wheel(self.plan_table)
             _, progress_layout = self.add_card()
             self.restore_progress_label = SubtitleLabel()
+            self.restore_stop_button = PushButton(icon("CANCEL"), "")
+            self.restore_stop_button.setMaximumWidth(120)
+            self.restore_stop_button.setEnabled(False)
+            self.restore_stop_button.clicked.connect(self.request_stop_restore)
+            restore_progress_header = QHBoxLayout()
+            restore_progress_header.addWidget(self.restore_progress_label)
+            restore_progress_header.addStretch(1)
+            restore_progress_header.addWidget(self.restore_stop_button)
             self.restore_progress_bar = QProgressBar()
             self.restore_progress_bar.setRange(0, 100)
             self.restore_progress_bar.setValue(0)
             self.restore_log_text = TextEdit()
             self.restore_log_text.setReadOnly(True)
             self.restore_log_text.setMaximumHeight(130)
-            progress_layout.addWidget(self.restore_progress_label)
+            progress_layout.addLayout(restore_progress_header)
             progress_layout.addWidget(self.restore_progress_bar)
             progress_layout.addWidget(self.restore_log_text)
             self.retranslate()
@@ -2122,6 +2737,53 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             if file_name:
                 self.package_path = Path(file_name)
                 self.package_input.setText(file_name)
+                self.load_restore_package_preview()
+
+        def load_restore_package_preview(self) -> None:
+            if not self.package_path:
+                return
+            try:
+                manifest = read_manifest(self.package_path, configured_temporary_root())
+                entries = list_entries(self.package_path)
+            except Exception as exc:
+                self.restore_package_summary.setText(str(exc))
+                self.restore_archive_preview.set_entries([])
+                return
+            data_entries = [
+                entry for entry in entries if entry.path.replace("\\", "/").startswith("data/")
+            ]
+            applications = manifest.get("installed_applications", [])
+            registry_entries = [
+                entry for entry in entries if entry.path.replace("\\", "/").startswith("registry/")
+            ]
+            self.restore_archive_preview.set_entries(data_entries)
+            self.restore_package_summary.setText(
+                "  |  ".join(
+                    [
+                        t("applications_count", count=len(applications)),
+                        t("file_count") + f": {len(data_entries)}",
+                        t("registry_exports") + f": {len(registry_entries)}",
+                    ]
+                )
+            )
+            self.restore_entry_preview.setPlainText(t("select_file_to_preview"))
+
+        def preview_restore_package_entry(self, entry_path: str) -> None:
+            if not self.package_path:
+                return
+            try:
+                if Path(entry_path).suffix.lower() in IMAGE_EXTENSIONS:
+                    self.restore_entry_preview.setPlainText(t("image_preview_failed"))
+                    return
+                self.restore_entry_preview.setPlainText(
+                    preview_entry_text(
+                        self.package_path,
+                        entry_path,
+                        configured_temporary_root(),
+                    )
+                )
+            except Exception as exc:
+                self.restore_entry_preview.setPlainText(str(exc))
 
         def choose_restore_root(self) -> None:
             directory = QFileDialog.getExistingDirectory(self, t("choose_restore_root"))
@@ -2190,10 +2852,18 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.restore_log_text.clear()
             self.log_restore(t("restore_starting"))
 
-            def task(progress):
-                return execute_restore_plan(plan, policy, progress, temporary_root)
+            def task(progress, cancel_event):
+                return execute_restore_plan(
+                    plan,
+                    policy,
+                    progress,
+                    temporary_root,
+                    cancel_event,
+                )
 
             self.restore_button.setEnabled(False)
+            self.restore_stop_button.setEnabled(True)
+            self.restore_progress_bar.setRange(0, 100)
             self.restore_progress_bar.setValue(0)
             self.restore_thread = QThread(self)
             self.restore_worker = BackupJobWorker(task)
@@ -2202,10 +2872,13 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.restore_worker.progress.connect(self.on_restore_progress)
             self.restore_worker.finished.connect(self.on_restore_finished)
             self.restore_worker.failed.connect(self.on_restore_failed)
+            self.restore_worker.cancelled.connect(self.on_restore_cancelled)
             self.restore_worker.finished.connect(self.restore_thread.quit)
             self.restore_worker.failed.connect(self.restore_thread.quit)
+            self.restore_worker.cancelled.connect(self.restore_thread.quit)
             self.restore_worker.finished.connect(self.restore_worker.deleteLater)
             self.restore_worker.failed.connect(self.restore_worker.deleteLater)
+            self.restore_worker.cancelled.connect(self.restore_worker.deleteLater)
             self.restore_thread.finished.connect(self.restore_thread.deleteLater)
             self.restore_thread.finished.connect(self.cleanup_restore_worker)
             self.restore_thread.start()
@@ -2215,7 +2888,14 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.restore_log_text.append(message)
 
         def on_restore_progress(self, message: str, current: int, total: int) -> None:
-            if total:
+            if total <= 0 or current < 0:
+                self.restore_progress_bar.setRange(0, 0)
+            elif total:
+                if (
+                    self.restore_progress_bar.minimum() != 0
+                    or self.restore_progress_bar.maximum() != 100
+                ):
+                    self.restore_progress_bar.setRange(0, 100)
                 self.restore_progress_bar.setValue(max(0, min(100, int(current / total * 100))))
             self.log_restore(message)
 
@@ -2234,10 +2914,24 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.log_restore(f"Restore failed: {message}")
             MessageBox(t("restore_failed"), message, self).exec()
 
+        def on_restore_cancelled(self, message: str) -> None:
+            self.restore_progress_bar.setRange(0, 100)
+            self.restore_progress_bar.setValue(0)
+            self.log_restore(message)
+            MessageBox(t("backup_cancelled"), t("backup_cancelled_body"), self).exec()
+
+        def request_stop_restore(self) -> None:
+            if not self.restore_worker or not confirm_stop_operation(self):
+                return
+            self.restore_worker.cancel()
+            self.restore_stop_button.setEnabled(False)
+            self.log_restore(t("stop_operation"))
+
         def cleanup_restore_worker(self) -> None:
             self.restore_thread = None
             self.restore_worker = None
             self.restore_button.setEnabled(self.restore_plan is not None)
+            self.restore_stop_button.setEnabled(False)
 
         def shutdown_workers(self) -> None:
             if self.restore_thread and self.restore_thread.isRunning():
@@ -2258,20 +2952,32 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.conflict_policy_combo.setItemText(1, t("conflict_overwrite"))
                 self.restore_confirm_checkbox.setText(t("restore_confirm"))
                 self.restore_button.setText(t("execute_restore"))
+                self.restore_package_contents_label.setText(t("package_contents"))
+                self.restore_archive_preview.retranslate()
+                if not self.restore_archive_preview.current_entry_path():
+                    self.restore_entry_preview.setPlainText(t("select_file_to_preview"))
                 self.restore_plan_label.setText(t("restore_plan"))
                 self.restore_progress_label.setText(t("restore_progress"))
+                self.restore_stop_button.setText(t("stop"))
                 self.plan_table.setHorizontalHeaderLabels(
                     [t("source"), t("destination"), t("state"), t("source_item")]
                 )
 
     class SettingsPage(Page):
         def __init__(
-            self, on_theme_changed, on_language_changed, on_developer_mode_changed
+            self,
+            on_theme_changed,
+            on_language_changed,
+            on_developer_mode_changed,
+            on_logging_changed,
         ) -> None:
             self.on_theme_changed = on_theme_changed
             self.on_language_changed = on_language_changed
             self.on_developer_mode_changed = on_developer_mode_changed
+            self.on_logging_changed = on_logging_changed
             super().__init__("settings_title", "settings_subtitle")
+
+            # Appearance and language are the settings users change most often.
             _, appearance_layout = self.add_card()
             self.appearance_label = SubtitleLabel()
             appearance_layout.addWidget(self.appearance_label)
@@ -2308,7 +3014,96 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             appearance_layout.addLayout(language_row)
             appearance_layout.addWidget(self.language_hint)
 
-            self.about_card, about_layout = self.add_card()
+            _, backup_layout = self.add_card()
+            self.backup_security_label = SubtitleLabel()
+            self.encrypt_default_checkbox = CheckBox()
+            self.encrypt_default_checkbox.setChecked(settings.encrypt_by_default)
+            self.encrypt_default_checkbox.stateChanged.connect(self.encrypt_default_changed)
+            self.sensitive_confirm_checkbox = CheckBox()
+            self.sensitive_confirm_checkbox.setChecked(settings.sensitive_confirm)
+            self.sensitive_confirm_checkbox.stateChanged.connect(self.sensitive_confirm_changed)
+            backup_layout.addWidget(self.backup_security_label)
+            backup_layout.addWidget(self.encrypt_default_checkbox)
+            backup_layout.addWidget(self.sensitive_confirm_checkbox)
+
+            _, storage_layout = self.add_card()
+            self.storage_label = SubtitleLabel()
+            self.temporary_root_label = BodyLabel()
+            self.temporary_root_input = LineEdit()
+            self.temporary_root_input.setReadOnly(True)
+            self.temporary_root_input.setMinimumHeight(38)
+            self.choose_temporary_root_button = PushButton(icon("FOLDER"), "")
+            self.choose_temporary_root_button.setMaximumWidth(180)
+            self.choose_temporary_root_button.clicked.connect(self.choose_temporary_root)
+            self.reset_temporary_root_button = PushButton(icon("SYNC", "CLEAR_SELECTION"), "")
+            self.reset_temporary_root_button.setMaximumWidth(170)
+            self.reset_temporary_root_button.clicked.connect(self.reset_temporary_root)
+            temporary_root_row = QHBoxLayout()
+            temporary_root_row.setSpacing(12)
+            temporary_root_row.addWidget(self.temporary_root_label)
+            temporary_root_row.addWidget(self.temporary_root_input, 1)
+            temporary_root_row.addWidget(self.choose_temporary_root_button)
+            temporary_root_row.addWidget(self.reset_temporary_root_button)
+
+            self.settings_directory_label = BodyLabel()
+            self.settings_directory_input = LineEdit()
+            self.settings_directory_input.setReadOnly(True)
+            self.settings_directory_input.setMinimumHeight(38)
+            self.choose_settings_directory_button = PushButton(icon("FOLDER"), "")
+            self.choose_settings_directory_button.setMaximumWidth(180)
+            self.choose_settings_directory_button.clicked.connect(self.choose_settings_directory)
+            self.reset_settings_directory_button = PushButton(icon("SYNC", "CLEAR_SELECTION"), "")
+            self.reset_settings_directory_button.setMaximumWidth(180)
+            self.reset_settings_directory_button.clicked.connect(self.reset_settings_directory)
+            settings_directory_row = QHBoxLayout()
+            settings_directory_row.setSpacing(12)
+            settings_directory_row.addWidget(self.settings_directory_label)
+            settings_directory_row.addWidget(self.settings_directory_input, 1)
+            settings_directory_row.addWidget(self.choose_settings_directory_button)
+            settings_directory_row.addWidget(self.reset_settings_directory_button)
+            storage_layout.addWidget(self.storage_label)
+            storage_layout.addLayout(temporary_root_row)
+            storage_layout.addLayout(settings_directory_row)
+
+            _, runtime_layout = self.add_card()
+            self.runtime_logs_label = SubtitleLabel()
+            self.runtime_logs_hint = CaptionLabel()
+            self.runtime_logs_hint.setWordWrap(True)
+            self.persist_runtime_logs_checkbox = CheckBox()
+            self.persist_runtime_logs_checkbox.setChecked(settings.persist_runtime_logs)
+            self.persist_runtime_logs_checkbox.stateChanged.connect(
+                self.persist_runtime_logs_changed
+            )
+            self.runtime_log_directory_label = BodyLabel()
+            self.runtime_log_directory_input = LineEdit()
+            self.runtime_log_directory_input.setReadOnly(True)
+            self.runtime_log_directory_input.setMinimumHeight(38)
+            self.open_runtime_log_directory_button = PushButton(icon("FOLDER"), "")
+            self.open_runtime_log_directory_button.setMaximumWidth(180)
+            self.open_runtime_log_directory_button.clicked.connect(self.open_runtime_log_directory)
+            runtime_directory_row = QHBoxLayout()
+            runtime_directory_row.setSpacing(12)
+            runtime_directory_row.addWidget(self.runtime_log_directory_label)
+            runtime_directory_row.addWidget(self.runtime_log_directory_input, 1)
+            runtime_directory_row.addWidget(self.open_runtime_log_directory_button)
+            runtime_layout.addWidget(self.runtime_logs_label)
+            runtime_layout.addWidget(self.runtime_logs_hint)
+            runtime_layout.addWidget(self.persist_runtime_logs_checkbox)
+            runtime_layout.addLayout(runtime_directory_row)
+
+            _, advanced_layout = self.add_card()
+            self.advanced_label = SubtitleLabel()
+            self.developer_mode_checkbox = CheckBox()
+            self.developer_mode_checkbox.setChecked(settings.developer_mode)
+            self.developer_mode_checkbox.stateChanged.connect(self.developer_mode_changed)
+            self.developer_mode_hint = CaptionLabel()
+            self.developer_mode_hint.setWordWrap(True)
+            advanced_layout.addWidget(self.advanced_label)
+            advanced_layout.addWidget(self.developer_mode_checkbox)
+            advanced_layout.addWidget(self.developer_mode_hint)
+
+            # Keep project information last: it is reference material, not a preference.
+            _, about_layout = self.add_card()
             self.about_label = SubtitleLabel()
             self.about_hint = CaptionLabel()
             self.about_hint.setWordWrap(True)
@@ -2353,45 +3148,41 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 link_grid.addWidget(button, 2 + index // 3, index % 3)
             about_layout.addLayout(link_grid)
 
-            _, backup_layout = self.add_card()
-            self.preferences_label = SubtitleLabel()
-            self.developer_mode_checkbox = CheckBox()
-            self.developer_mode_checkbox.setChecked(settings.developer_mode)
-            self.developer_mode_checkbox.stateChanged.connect(self.developer_mode_changed)
-            self.developer_mode_hint = CaptionLabel()
-            self.developer_mode_hint.setWordWrap(True)
-            self.encrypt_default_checkbox = CheckBox()
-            self.encrypt_default_checkbox.setChecked(settings.encrypt_by_default)
-            self.encrypt_default_checkbox.stateChanged.connect(self.encrypt_default_changed)
-            self.sensitive_confirm_checkbox = CheckBox()
-            self.sensitive_confirm_checkbox.setChecked(settings.sensitive_confirm)
-            self.sensitive_confirm_checkbox.stateChanged.connect(self.sensitive_confirm_changed)
-            self.temporary_root_label = BodyLabel()
-            self.temporary_root_input = LineEdit()
-            self.temporary_root_input.setReadOnly(True)
-            self.temporary_root_input.setMinimumHeight(38)
-            self.choose_temporary_root_button = PushButton(icon("FOLDER"), "")
-            self.choose_temporary_root_button.setMaximumWidth(180)
-            self.choose_temporary_root_button.clicked.connect(self.choose_temporary_root)
-            self.reset_temporary_root_button = PushButton(icon("SYNC", "CLEAR_SELECTION"), "")
-            self.reset_temporary_root_button.setMaximumWidth(170)
-            self.reset_temporary_root_button.clicked.connect(self.reset_temporary_root)
-            temporary_root_row = QHBoxLayout()
-            temporary_root_row.setSpacing(12)
-            temporary_root_row.addWidget(self.temporary_root_label)
-            temporary_root_row.addWidget(self.temporary_root_input, 1)
-            temporary_root_row.addWidget(self.choose_temporary_root_button)
-            temporary_root_row.addWidget(self.reset_temporary_root_button)
-            backup_layout.addWidget(self.preferences_label)
-            backup_layout.addWidget(self.developer_mode_checkbox)
-            backup_layout.addWidget(self.developer_mode_hint)
-            backup_layout.addWidget(self.encrypt_default_checkbox)
-            backup_layout.addWidget(self.sensitive_confirm_checkbox)
-            backup_layout.addLayout(temporary_root_row)
-            self.root_layout.removeWidget(self.about_card)
-            self.root_layout.insertWidget(self.root_layout.count(), self.about_card)
+            self.support_label = SubtitleLabel()
+            self.support_hint = CaptionLabel()
+            self.support_hint.setWordWrap(True)
+            self.support_qr_label = QLabel()
+            self.support_qr_label.setFixedSize(176, 176)
+            self.support_qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.support_qr_label.setToolTip("Alipay")
+            support_text_layout = QVBoxLayout()
+            support_text_layout.setSpacing(8)
+            support_text_layout.addWidget(self.support_label)
+            support_text_layout.addWidget(self.support_hint)
+            support_text_layout.addStretch(1)
+            support_row = QHBoxLayout()
+            support_row.setSpacing(22)
+            support_row.addLayout(support_text_layout, 1)
+            support_row.addWidget(self.support_qr_label)
+            about_layout.addSpacing(8)
+            about_layout.addLayout(support_row)
+            self.load_support_qr()
             self.root_layout.addStretch(1)
             self.retranslate()
+
+        def load_support_qr(self) -> None:
+            pixmap = QPixmap(str(asset_path("alipay.jpg")))
+            if pixmap.isNull():
+                self.support_qr_label.clear()
+                return
+            self.support_qr_label.setPixmap(
+                pixmap.scaled(
+                    164,
+                    164,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
 
         def theme_button_clicked(self, button: CheckBox) -> None:
             for other in self.theme_group.buttons():
@@ -2417,6 +3208,16 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             settings.sensitive_confirm = self.sensitive_confirm_checkbox.isChecked()
             save_settings(settings)
 
+        def persist_runtime_logs_changed(self) -> None:
+            settings.persist_runtime_logs = self.persist_runtime_logs_checkbox.isChecked()
+            save_settings(settings)
+            self.on_logging_changed(settings.persist_runtime_logs)
+
+        def open_runtime_log_directory(self) -> None:
+            directory = runtime_log_directory(configured_temporary_root())
+            directory.mkdir(parents=True, exist_ok=True)
+            open_local_path(directory, "Opening runtime log directory")
+
         def developer_mode_changed(self) -> None:
             settings.developer_mode = self.developer_mode_checkbox.isChecked()
             save_settings(settings)
@@ -2428,11 +3229,30 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 return
             settings.temporary_root = str(Path(directory))
             save_settings(settings)
+            self.on_logging_changed(settings.persist_runtime_logs)
             self.sync_from_settings()
 
         def reset_temporary_root(self) -> None:
             settings.temporary_root = None
             save_settings(settings)
+            self.on_logging_changed(settings.persist_runtime_logs)
+            self.sync_from_settings()
+
+        def choose_settings_directory(self) -> None:
+            directory = QFileDialog.getExistingDirectory(self, t("choose_settings_directory"))
+            if not directory:
+                return
+            if not set_settings_directory(settings, Path(directory)):
+                MessageBox(t("settings_title"), t("settings_directory_update_failed"), self).exec()
+                return
+            logger.info("Configuration directory changed to: %s", settings_directory())
+            self.sync_from_settings()
+
+        def reset_settings_directory(self) -> None:
+            if not reset_settings_directory(settings):
+                MessageBox(t("settings_title"), t("settings_directory_update_failed"), self).exec()
+                return
+            logger.info("Configuration directory reset to: %s", settings_directory())
             self.sync_from_settings()
 
         def sync_from_settings(self) -> None:
@@ -2453,12 +3273,19 @@ def run_app(auto_quit_ms: int | None = None) -> int:
             self.sensitive_confirm_checkbox.blockSignals(True)
             self.sensitive_confirm_checkbox.setChecked(settings.sensitive_confirm)
             self.sensitive_confirm_checkbox.blockSignals(False)
+            self.persist_runtime_logs_checkbox.blockSignals(True)
+            self.persist_runtime_logs_checkbox.setChecked(settings.persist_runtime_logs)
+            self.persist_runtime_logs_checkbox.blockSignals(False)
             self.developer_mode_checkbox.blockSignals(True)
             self.developer_mode_checkbox.setChecked(settings.developer_mode)
             self.developer_mode_checkbox.blockSignals(False)
             self.temporary_root_input.setText(
                 settings.temporary_root or t("temporary_root_system")
             )
+            self.runtime_log_directory_input.setText(
+                str(runtime_log_directory(configured_temporary_root()))
+            )
+            self.settings_directory_input.setText(str(settings_directory()))
 
         def retranslate(self) -> None:
             super().retranslate()
@@ -2471,19 +3298,31 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.theme_buttons["dark"].setText(t("theme_dark"))
                 self.language_label.setText(t("language"))
                 self.language_hint.setText(t("language_hint"))
+                self.backup_security_label.setText(t("backup_security"))
+                self.encrypt_default_checkbox.setText(t("encrypt_by_default"))
+                self.sensitive_confirm_checkbox.setText(t("sensitive_confirm"))
+                self.storage_label.setText(t("storage"))
+                self.temporary_root_label.setText(t("temporary_root"))
+                self.choose_temporary_root_button.setText(t("choose_temporary_root"))
+                self.reset_temporary_root_button.setText(t("reset_temporary_root"))
+                self.settings_directory_label.setText(t("settings_directory"))
+                self.choose_settings_directory_button.setText(t("choose_settings_directory"))
+                self.reset_settings_directory_button.setText(t("reset_settings_directory"))
+                self.runtime_logs_label.setText(t("runtime_logs"))
+                self.runtime_logs_hint.setText(t("runtime_logs_hint"))
+                self.persist_runtime_logs_checkbox.setText(t("persist_runtime_logs"))
+                self.runtime_log_directory_label.setText(t("runtime_log_directory"))
+                self.open_runtime_log_directory_button.setText(t("open_log_directory"))
+                self.advanced_label.setText(t("advanced"))
+                self.developer_mode_checkbox.setText(t("developer_mode"))
+                self.developer_mode_hint.setText(t("developer_mode_hint"))
                 self.about_label.setText(t("about_project"))
                 self.about_hint.setText(t("about_project_hint"))
                 self.project_home_button.setText(t("project_home"))
                 self.license_button.setText(t("license_file"))
                 self.open_source_label.setText(t("open_source_projects"))
-                self.preferences_label.setText(t("backup_preferences"))
-                self.developer_mode_checkbox.setText(t("developer_mode"))
-                self.developer_mode_hint.setText(t("developer_mode_hint"))
-                self.encrypt_default_checkbox.setText(t("encrypt_by_default"))
-                self.sensitive_confirm_checkbox.setText(t("sensitive_confirm"))
-                self.temporary_root_label.setText(t("temporary_root"))
-                self.choose_temporary_root_button.setText(t("choose_temporary_root"))
-                self.reset_temporary_root_button.setText(t("reset_temporary_root"))
+                self.support_label.setText(t("support_project"))
+                self.support_hint.setText(t("support_project_hint"))
 
     class MainWindow(FluentWindow):
         def __init__(self) -> None:
@@ -2503,6 +3342,7 @@ def run_app(auto_quit_ms: int | None = None) -> int:
                 self.change_theme,
                 self.retranslate_pages,
                 self.change_developer_mode,
+                self.change_runtime_log_persistence,
             )
             self.pages = [
                 self.smart,
@@ -2556,6 +3396,13 @@ def run_app(auto_quit_ms: int | None = None) -> int:
         def change_developer_mode(self, enabled: bool) -> None:
             settings.developer_mode = enabled
             self.apply_developer_mode()
+
+        def change_runtime_log_persistence(self, enabled: bool) -> None:
+            log_path = configure_application_logging(enabled, configured_temporary_root())
+            if log_path:
+                logger.info("Persistent runtime logging enabled")
+            else:
+                logger.info("Persistent runtime logging disabled")
 
         def apply_developer_mode(self) -> None:
             enabled = settings.developer_mode
@@ -2674,12 +3521,10 @@ def run_app(auto_quit_ms: int | None = None) -> int:
 
         def closeEvent(self, event) -> None:
             if (
-                self.smart.backup_thread
-                and self.smart.backup_thread.isRunning()
-                or self.full.full_backup_thread
-                and self.full.full_backup_thread.isRunning()
-                or self.restore.restore_thread
-                and self.restore.restore_thread.isRunning()
+                (self.smart.backup_thread and self.smart.backup_thread.isRunning())
+                or (self.smart.preflight_thread and self.smart.preflight_thread.isRunning())
+                or (self.full.full_backup_thread and self.full.full_backup_thread.isRunning())
+                or (self.restore.restore_thread and self.restore.restore_thread.isRunning())
             ):
                 MessageBox(t("backup_running_title"), t("backup_running_body"), self).exec()
                 event.ignore()
@@ -2705,6 +3550,8 @@ def run_app(auto_quit_ms: int | None = None) -> int:
         pass
 
     app = QApplication(sys.argv)
+    interaction_log_filter = InteractionLogFilter(app)
+    app.installEventFilter(interaction_log_filter)
     app.installTranslator(FluentTranslator())
     apply_app_style(app)
     window = MainWindow()

@@ -2,21 +2,17 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 
 import app_info
 from adapters.catalog import discover_backup_items
 from backup.package import create_backup_package
+from core.logging_config import configure_application_logging
 from core.models import ArchiveFormat
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        stream=sys.stdout,
-    )
+    configure_application_logging(save_to_file=False)
     logger = logging.getLogger("backUpHelper")
     parser = argparse.ArgumentParser(prog="back-up-helper")
     parser.add_argument("--version", action="version", version=f"%(prog)s {app_info.__version__}")

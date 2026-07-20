@@ -196,3 +196,57 @@ def copy_entry_to(
             iso.close()
         return destination
     raise RuntimeError(f"Restore is not implemented for {package_path.suffix}")
+
+
+def extract_package_to(
+    package_path: Path,
+    destination: Path,
+    temporary_root: Path | None = None,
+) -> Path:
+    """Extract a whole package while rejecting paths that escape the destination."""
+    entries = list_entries(package_path)
+    for entry in entries:
+        relative_path = PurePosixPath(entry.path.replace("\\", "/"))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(f"Unsafe package entry path: {entry.path}")
+
+    destination.mkdir(parents=True, exist_ok=True)
+    if package_path.is_dir():
+        for entry in entries:
+            copy_entry_to(package_path, entry.path, destination / entry.path, temporary_root)
+        return destination
+    if package_path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(package_path) as archive:
+            for entry in entries:
+                target = destination / PurePosixPath(entry.path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(entry.path) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output, 1024 * 1024)
+        return destination
+    if package_path.suffix.lower() == ".7z":
+        try:
+            import py7zr
+        except ImportError as exc:
+            raise RuntimeError("py7zr is required to extract .7z packages") from exc
+
+        with py7zr.SevenZipFile(package_path) as archive:
+            archive.extractall(path=destination)
+        return destination
+    if package_path.suffix.lower() == ".iso":
+        try:
+            import pycdlib
+        except ImportError as exc:
+            raise RuntimeError("pycdlib is required to extract ISO packages") from exc
+
+        iso = pycdlib.PyCdlib()
+        try:
+            iso.open(str(package_path))
+            for entry in entries:
+                target = destination / PurePosixPath(entry.path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as output:
+                    iso.get_file_from_iso_fp(output, joliet_path="/" + entry.path.lstrip("/"))
+        finally:
+            iso.close()
+        return destination
+    raise RuntimeError(f"Extraction is not implemented for {package_path.suffix}")

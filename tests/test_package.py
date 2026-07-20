@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 
+import backup.package as package_module
 from backup.package import create_backup_package
+from core.cancellation import OperationCancelledError
 from core.models import ArchiveFormat, BackupItem
 from preview.file_preview import preview_entry_text
-from preview.package_reader import copy_entry_to, list_entries, read_manifest
+from preview.package_reader import copy_entry_to, extract_package_to, list_entries, read_manifest
 
 
 def test_create_directory_package_with_manifest(tmp_path: Path) -> None:
@@ -34,6 +37,31 @@ def test_create_directory_package_with_manifest(tmp_path: Path) -> None:
     assert "ok" in preview_entry_text(package, "data/demo/settings.json")
 
 
+def test_extract_zip_package_to_destination(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "settings.json").write_text('{"ok": true}', encoding="utf-8")
+    item = BackupItem(
+        id="demo",
+        name="Demo App",
+        category="Test",
+        path=source,
+        reason="Extraction test.",
+    )
+    package = create_backup_package(
+        tmp_path / "out",
+        [item],
+        ArchiveFormat.ZIP,
+        include_system_inventory=False,
+    )
+
+    extraction = extract_package_to(package, tmp_path / "extracted")
+
+    assert extraction == tmp_path / "extracted"
+    extracted_file = extraction / "data" / "demo" / "settings.json"
+    assert extracted_file.read_text(encoding="utf-8") == '{"ok": true}'
+
+
 def test_create_encrypted_zip_package(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -55,6 +83,74 @@ def test_create_encrypted_zip_package(tmp_path: Path) -> None:
     )
 
     assert package.name.endswith(".zip.enc")
+
+
+def test_zip_archive_reads_sources_directly_without_data_staging(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "settings.json").write_text("{}", encoding="utf-8")
+    item = BackupItem(
+        id="demo",
+        name="Demo App",
+        category="Test",
+        path=source,
+        reason="Direct archive test.",
+    )
+
+    def fail_if_staged(*_args, **_kwargs):
+        raise AssertionError("ZIP source data should not be staged before compression")
+
+    monkeypatch.setattr(package_module, "_stage_files", fail_if_staged)
+    package = create_backup_package(
+        tmp_path / "out",
+        [item],
+        ArchiveFormat.ZIP,
+        include_system_inventory=False,
+    )
+
+    assert package.is_file()
+    assert read_manifest(package)["files"][0]["relative_path"] == "data/demo/settings.json"
+
+
+def test_cancelled_archive_removes_partial_output(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "first.json").write_text("{}", encoding="utf-8")
+    (source / "second.json").write_text("{}", encoding="utf-8")
+    item = BackupItem(
+        id="demo",
+        name="Demo App",
+        category="Test",
+        path=source,
+        reason="Cancellation test.",
+    )
+    cancel_event = Event()
+    output = tmp_path / "out" / "cancelled.zip"
+
+    def stop_after_first_source_file(message: str, _current: int, _total: int) -> None:
+        if message.startswith("Compressed data/demo/"):
+            cancel_event.set()
+
+    try:
+        create_backup_package(
+            output.parent,
+            [item],
+            ArchiveFormat.ZIP,
+            include_system_inventory=False,
+            output_path=output,
+            cancel_event=cancel_event,
+            progress=stop_after_first_source_file,
+        )
+    except OperationCancelledError:
+        pass
+    else:
+        raise AssertionError("Expected cancelled backup to stop")
+
+    assert not output.exists()
+    assert not output.with_suffix(".zip.enc").exists()
 
 
 def test_create_package_respects_item_exclusions(tmp_path: Path) -> None:

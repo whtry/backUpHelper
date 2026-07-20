@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from threading import Event
 
+from core.cancellation import raise_if_cancelled
 from preview.package_reader import copy_entry_to, read_manifest
 from restore.planner import RestorePlan
 
@@ -29,6 +31,7 @@ def execute_restore_plan(
     conflict_policy: str = "skip",
     progress: ProgressCallback | None = None,
     temporary_root: Path | None = None,
+    cancel_event: Event | None = None,
 ) -> RestoreResult:
     """Restore manifest files only, never registry data or executable commands."""
     if conflict_policy not in {"skip", "overwrite"}:
@@ -39,6 +42,7 @@ def execute_restore_plan(
     restored = skipped_conflicts = skipped_unsafe = 0
     total = max(1, len(plan.operations))
     for index, operation in enumerate(plan.operations, start=1):
+        raise_if_cancelled(cancel_event)
         relative_path = _safe_relative_path(operation.source_relative_path)
         if relative_path is None or operation.source_relative_path not in manifest_files:
             skipped_unsafe += 1
